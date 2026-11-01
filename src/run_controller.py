@@ -7,9 +7,7 @@ Gradio UI can:
 * poll the latest state for a run_id
 * request cancellation (interrupts the LangGraph execution)
 
-NOTE: The actual persistence is handled by the LangGraph SQLite
-checkpointer configured in ``src.graph``. ``GRAPH.get_state`` is used to
-recover the latest VentureForgeState snapshot for a given run_id.
+NOTE: The graph currently uses LangGraph MemorySaver. Checkpoints are process-local and are lost on restart. GRAPH.get_state reads the current process snapshot.
 """
 from __future__ import annotations
 

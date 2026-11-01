@@ -52,3 +52,9 @@ Thumbs.db
 dist/
 build/
 *.egg-info/
+
+# Generated research output
+reports/
+data/
+
+.cache/

@@ -147,26 +147,32 @@ class Settings(BaseSettings):
 
     @property
     def effective_llm_config(self) -> dict:
-        """Return the active LLM configuration as a dict."""
+        """Return the active provider configuration.
+
+        An explicit LLM_API_KEY takes precedence. Otherwise, use the optional
+        OpenRouter key and endpoint, including the provider-qualified default
+        model ID required by OpenRouter.
+        """
+        use_openrouter = bool(self.openrouter_api_key and not self.llm_api_key)
+        model_name = self.llm_model
+        if use_openrouter and model_name == "gpt-4o-mini":
+            model_name = "openai/gpt-4o-mini"
         return {
-            "base_url": self.llm_base_url,
-            "api_key": self.llm_api_key,
-            "model": self.llm_model,
+            "base_url": self.openrouter_base_url if use_openrouter else self.llm_base_url,
+            "api_key": self.openrouter_api_key if use_openrouter else self.llm_api_key,
+            "model": model_name,
             "timeout": self.request_timeout,
         }
 
     def get_llm_config(self, *, reasoning: bool = False) -> dict:
-        """Return LLM config for a given tier.
-
-        reasoning=True  → scorer, critic (large model)
-        reasoning=False → pain_point_miner, idea_generator, pitch_writer (fast model)
-        """
-        if reasoning:
-            return self.effective_llm_config
+        """Return provider config for reasoning or fast tasks."""
+        active = self.effective_llm_config
+        if reasoning or not any((self.fast_llm_base_url, self.fast_llm_api_key, self.fast_llm_model)):
+            return active
         return {
-            "base_url": self.fast_llm_base_url or self.llm_base_url,
-            "api_key": self.fast_llm_api_key or self.llm_api_key,
-            "model": self.fast_llm_model or self.llm_model,
+            "base_url": self.fast_llm_base_url or active["base_url"],
+            "api_key": self.fast_llm_api_key or active["api_key"],
+            "model": self.fast_llm_model or active["model"],
             "timeout": self.request_timeout,
         }
 

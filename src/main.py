@@ -48,8 +48,7 @@ def run_pipeline(
     """Execute the full end-to-end pipeline and return final state.
 
     If ``resume_run_id`` is provided, the pipeline resumes from the latest
-    checkpoint for that ``run_id`` (thread_id) using the LangGraph SQLite
-    checkpointer and ignores ``domain``/``max_pain_points``.
+    checkpoint for that ``run_id`` (thread_id) using the in-memory LangGraph checkpointer (process-local and not durable across restarts) and ignores ``domain``/``max_pain_points``.
     """
 
     # Resume mode: load state from existing checkpoints and continue.
