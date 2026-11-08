@@ -4,12 +4,22 @@ from typing import Any
 from uuid import uuid4
 import diskcache
 import requests
+from urllib.parse import urlsplit
 from src.config import settings
 from src.research.models import SourceSnapshot
 
 _CACHE=diskcache.Cache(settings.cache_dir)
 _TTL_SECONDS=settings.cache_ttl_hours*3600
 _RETRY_STATUSES={408,425,429,500,502,503,504}
+
+class ResearchConnectorError(RuntimeError):
+    """Expected connector failure with a secret-free message for CLI output."""
+
+def _safe_request_error(connector:str,url:str,exc:requests.RequestException)->ResearchConnectorError:
+    status=getattr(getattr(exc,"response",None),"status_code",None)
+    host=urlsplit(url).hostname or "remote service"
+    detail=f"HTTP {status}" if status else type(exc).__name__
+    return ResearchConnectorError(f"{connector} request to {host} failed ({detail}). Check network access and service availability.")
 
 def request_json(session:Any,method:str,url:str,*,timeout:int,payload:dict|None=None,params:dict|None=None,retries:int=2,sleep_fn=time.sleep)->dict:
     for attempt in range(retries+1):
@@ -51,7 +61,10 @@ class TavilyConnector:
         cached=self.cache.get(cache_key,default=None)
         if cached is not None: return _restore_sources(cached,run_id,question_id,category)
         payload={"api_key":self.key,"query":query,"search_depth":"basic","max_results":max_results,"include_answer":False,"include_raw_content":True}
-        data=request_json(self.session,"post","https://api.tavily.com/search",timeout=self.timeout,payload=payload,retries=self.retries,sleep_fn=self.sleep_fn)
+        try:
+            data=request_json(self.session,"post","https://api.tavily.com/search",timeout=self.timeout,payload=payload,retries=self.retries,sleep_fn=self.sleep_fn)
+        except requests.RequestException as exc:
+            raise _safe_request_error("Tavily", "https://api.tavily.com/search", exc) from exc
         rows=[]; seen=set()
         for item in data.get("results",[]):
             url=str(item.get("url","")).strip()
@@ -72,8 +85,12 @@ class HackerNewsConnector:
         cache_key=("research_hn",query,max_results)
         cached=self.cache.get(cache_key,default=None)
         if cached is not None: return _restore_sources(cached,run_id,question_id,category)
-        data=request_json(self.session,"get","https://hn.algolia.com/api/v1/search_by_date",timeout=self.timeout,
-            params={"query":query,"tags":"comment","hitsPerPage":min(max_results,50)},retries=self.retries,sleep_fn=self.sleep_fn)
+        url="https://hn.algolia.com/api/v1/search_by_date"
+        try:
+            data=request_json(self.session,"get",url,timeout=self.timeout,
+                params={"query":query,"tags":"comment","hitsPerPage":min(max_results,50)},retries=self.retries,sleep_fn=self.sleep_fn)
+        except requests.RequestException as exc:
+            raise _safe_request_error("Hacker News", url, exc) from exc
         import re
         from html import unescape
         rows=[]; seen=set()

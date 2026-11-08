@@ -3,8 +3,9 @@ from concurrent.futures import ThreadPoolExecutor,as_completed,TimeoutError
 from dataclasses import dataclass,field
 from urllib.parse import parse_qsl,urlsplit,urlunsplit,urlencode
 from src.research.budget import BudgetExceeded,SearchBudget
+from src.research.connectors import ResearchConnectorError
 from src.research.models import ResearchQuestion,SourceSnapshot
-from src.research.safe_fetch import SafeFetcher,UnsafeURLError
+from src.research.safe_fetch import FetchError,SafeFetcher,UnsafeURLError
 
 HINTS={
     "official":"official government primary sources",
@@ -20,6 +21,7 @@ class CollectionFailure:
     category:str
     connector:str
     reason:str
+    error:BaseException|None=field(default=None,repr=False,compare=False)
 
 @dataclass
 class CollectionResult:
@@ -29,6 +31,9 @@ class CollectionResult:
     tavily_credits:int=0
     pages_fetched:int=0
     elapsed_seconds:float=0.0
+    searches_attempted:int=0
+    searches_succeeded:int=0
+    searches_failed:int=0
 
 def normalize_source_url(url:str)->str:
     parts=urlsplit(url)
@@ -65,7 +70,7 @@ class SearchOrchestrator:
                     except BudgetExceeded as exc:
                         failures.append(CollectionFailure(question.id,category,connector.name,str(exc)))
 
-        indexed={}
+        indexed={}; completed=set(); searches_succeeded=0; searches_failed=0
         with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
             futures={}
             for index,(question,category,connector,query) in enumerate(jobs):
@@ -75,16 +80,28 @@ class SearchOrchestrator:
             try:
                 for future in as_completed(futures,timeout=budget.remaining_seconds()):
                     index,question,category,connector=futures[future]
-                    try: indexed[index]=future.result()
-                    except Exception as exc: failures.append(CollectionFailure(question.id,category,connector.name,str(exc)))
+                    completed.add(future)
+                    try:
+                        indexed[index]=future.result()
+                        searches_succeeded+=1
+                    except ResearchConnectorError as exc:
+                        searches_failed+=1
+                        failures.append(CollectionFailure(question.id,category,connector.name,str(exc),exc))
             except TimeoutError:
                 for future,(index,question,category,connector) in futures.items():
                     if not future.done():
                         future.cancel()
-                        failures.append(CollectionFailure(question.id,category,connector.name,"Search exceeded the remaining time budget."))
-                    elif future not in indexed:
-                        try: indexed[index]=future.result()
-                        except Exception as exc: failures.append(CollectionFailure(question.id,category,connector.name,str(exc)))
+                        searches_failed+=1
+                        error=TimeoutError("Search exceeded the remaining time budget.")
+                        failures.append(CollectionFailure(question.id,category,connector.name,str(error),error))
+                    elif future not in completed:
+                        completed.add(future)
+                        try:
+                            indexed[index]=future.result()
+                            searches_succeeded+=1
+                        except ResearchConnectorError as exc:
+                            searches_failed+=1
+                            failures.append(CollectionFailure(question.id,category,connector.name,str(exc),exc))
 
         raw_sources=[]
         for index in sorted(indexed): raw_sources.extend(indexed[index])
@@ -106,7 +123,8 @@ class SearchOrchestrator:
         stats=budget.snapshot()
         return CollectionResult(sources=list(merged.values()),failures=failures,
             search_calls=stats["search_calls"],tavily_credits=stats["tavily_credits"],
-            pages_fetched=stats["pages_fetched"],elapsed_seconds=stats["elapsed_seconds"])
+            pages_fetched=stats["pages_fetched"],elapsed_seconds=stats["elapsed_seconds"],
+            searches_attempted=len(jobs),searches_succeeded=searches_succeeded,searches_failed=searches_failed)
 
     def _fetch_missing(self,sources:list[SourceSnapshot],budget:SearchBudget):
         output=list(sources); failures=[]
@@ -129,7 +147,7 @@ class SearchOrchestrator:
                         page=future.result()
                         output[index]=source.model_copy(update={"url":page.final_url,"final_url":page.final_url,
                             "content":page.text,"content_type":page.content_type,"content_origin":"safe_fetch","fetch_error":""})
-                    except Exception as exc:
+                    except (FetchError,UnsafeURLError) as exc:
                         origin="fetch_blocked" if isinstance(exc,UnsafeURLError) else "fetch_failed"
                         output[index]=source.model_copy(update={"content_origin":origin,"fetch_error":str(exc)})
                         failures.append(CollectionFailure(source.question_id,"fetch","safe_fetch",str(exc)))

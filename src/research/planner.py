@@ -3,11 +3,29 @@ import json
 import re
 from datetime import datetime, timezone
 from typing import Callable
+from openai import OpenAIError
+from pydantic import ValidationError
 from langchain_core.messages import HumanMessage, SystemMessage
 from src.llm.client import get_structured_llm
 from src.research.models import CompetitionInput, IntakeExtraction, PlanningDraft, ProblemBrief, QuestionDraft, ResearchPlan, ResearchQuestion, ResearchRun
 
+
+class ResearchProviderError(RuntimeError):
+    """An expected provider/configuration failure safe to show in the CLI."""
+
+
+def require_llm_configuration(config: dict) -> None:
+    missing = [name for name, value in (("API key", config.get("api_key")),
+        ("base URL", config.get("base_url")), ("model", config.get("model"))) if not value]
+    if missing:
+        raise ResearchProviderError(
+            "LLM configuration is incomplete (missing " + ", ".join(missing) +
+            "). Set LLM_API_KEY, LLM_BASE_URL, and LLM_MODEL in the environment or .env file."
+        )
+
 def _generate_draft(problem_statement:str, competition:CompetitionInput)->PlanningDraft:
+    from src.config import settings
+    require_llm_configuration(settings.get_llm_config(reasoning=True))
     llm=get_structured_llm(PlanningDraft,temperature=0,reasoning=True)
     system=("You are a hackathon research planner. Extract only what the supplied material supports. "
             "Keep user-provided details distinct from assumptions and missing information. "
@@ -17,8 +35,17 @@ def _generate_draft(problem_statement:str, competition:CompetitionInput)->Planni
             "capabilities, and official data; use first-person/community sources for user pain.")
     user=("PROBLEM STATEMENT (user provided):\n"+problem_statement+
           "\n\nCOMPETITION DETAILS (user provided JSON):\n"+competition.model_dump_json(indent=2))
-    value=llm.invoke([SystemMessage(content=system),HumanMessage(content=user)])
-    return value if isinstance(value,PlanningDraft) else PlanningDraft.model_validate(value)
+    try:
+        value=llm.invoke([SystemMessage(content=system),HumanMessage(content=user)])
+        return value if isinstance(value,PlanningDraft) else PlanningDraft.model_validate(value)
+    except OpenAIError as exc:
+        raise ResearchProviderError(
+            "LLM provider request failed while creating the research plan. Check network access, provider status, and configured credentials."
+        ) from exc
+    except ValidationError as exc:
+        raise ResearchProviderError(
+            "LLM provider returned a planning response that did not match the required schema. Check the selected model/provider and try again."
+        ) from exc
 
 def generate_research_plan(problem_statement:str,competition:CompetitionInput|None=None,*,draft_provider:Callable|None=None)->ResearchPlan:
     problem_statement=problem_statement.strip()

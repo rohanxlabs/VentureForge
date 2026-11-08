@@ -9,12 +9,12 @@ from src.research.storage import ResearchStore
 from src.research.verification import verify_candidate
 DEFAULT_PROMPT="Research the operational challenges of landslide early-warning systems in Northeast India."
 DEFAULT_QUESTION="What operational challenges affect the delivery of landslide warnings?"
-def run_vertical_slice(*,prompt=DEFAULT_PROMPT,question_text=DEFAULT_QUESTION,database_path="data/research.sqlite",output_path=None,connector=None,extractor=extract_candidate):
+def run_vertical_slice(*,prompt=DEFAULT_PROMPT,question_text=DEFAULT_QUESTION,database_path="data/research.sqlite",output_path=None,connector=None,extractor=extract_candidate,project_id=None):
     if connector is None:
         if not settings.tavily_api_key: raise RuntimeError("TAVILY_API_KEY is not configured.")
         connector=TavilyConnector(settings.tavily_api_key)
     run=ResearchRun(prompt=prompt); question=ResearchQuestion(run_id=run.id,text=question_text); store=ResearchStore(database_path)
-    store.save_run(run); store.save_question(question)
+    store.save_run(run,project_id=project_id); store.save_question(question)
     sources=connector.search(run_id=run.id,question_id=question.id,query=f"{question_text} {prompt}",max_results=1)
     for source in sources: store.save_source(source)
     if sources:

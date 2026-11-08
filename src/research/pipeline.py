@@ -7,6 +7,7 @@ from src.research.collection import collect_plan_sources
 from src.research.extraction import extract_candidate
 from src.research.gaps import ResearchGapReport, evaluate_research_gaps
 from src.research.models import ResearchPlan, VerificationStatus
+from src.research.planner import ResearchProviderError
 from src.research.search import CollectionFailure, SearchOrchestrator
 from src.research.storage import ResearchStore
 from src.research.verification import verify_candidate
@@ -19,6 +20,25 @@ class ResearchExecution:
     sources_collected: int
     evidence_extracted: int
     failures: list
+    searches_attempted: int = 0
+    searches_succeeded: int = 0
+    searches_failed: int = 0
+
+
+class CollectionUnavailableError(RuntimeError):
+    """Raised when every connector request fails and no research report is valid."""
+
+    def __init__(self, failures: list[CollectionFailure], searches_attempted: int):
+        self.failures = failures
+        self.searches_attempted = searches_attempted
+        connectors = ", ".join(dict.fromkeys(item.connector for item in failures if item.error is not None))
+        if not connectors:
+            connectors = "all configured search connectors"
+        details = "; ".join(dict.fromkeys(item.reason for item in failures if item.error is not None))
+        detail_text = f" Details: {details}" if details else ""
+        super().__init__(
+            f"All {searches_attempted} attempted search requests failed ({connectors}); no research report was generated. Check network access and connector availability.{detail_text}"
+        )
 
 
 def run_gap_research(
@@ -43,6 +63,9 @@ def run_gap_research(
     failures: list[CollectionFailure] = []
     sources_collected = 0
     evidence_extracted = 0
+    searches_attempted = 0
+    searches_succeeded = 0
+    searches_failed = 0
     current_questions = list(plan.questions)
     gap_report = evaluate_research_gaps(current_questions, [], [], min_independent_sources=min_independent_sources)
 
@@ -53,6 +76,9 @@ def run_gap_research(
         collected = collect_plan_sources(active_plan, store, budget=budget, orchestrator=orchestrator)
         failures.extend(collected.failures)
         sources_collected += len(collected.sources)
+        searches_attempted += collected.searches_attempted
+        searches_succeeded += collected.searches_succeeded
+        searches_failed += collected.searches_failed
         _, _, _, prior_evidence = store.get_run_records(plan.run_id)
         already_verified={(item.question_id,item.source_id) for item in prior_evidence
             if item.verification_status == VerificationStatus.VERIFIED}
@@ -69,7 +95,7 @@ def run_gap_research(
                         candidate=candidate, collected_sources=collected.sources)
                     store.save_evidence(record)
                     evidence_extracted += 1
-                except Exception as exc:
+                except ResearchProviderError as exc:
                     failures.append(CollectionFailure(question.id,"extraction","evidence_extractor",str(exc)))
 
         _, saved_questions, saved_sources, saved_evidence = store.get_run_records(plan.run_id)
@@ -91,4 +117,11 @@ def run_gap_research(
     _, saved_questions, saved_sources, saved_evidence = store.get_run_records(plan.run_id)
     gap_report = evaluate_research_gaps(saved_questions, saved_sources, saved_evidence,
         rounds=gap_report.rounds, min_independent_sources=min_independent_sources)
-    return ResearchExecution(gap_report, gap_report.rounds, sources_collected, evidence_extracted, failures)
+    if searches_attempted > 0 and searches_succeeded == 0 and searches_failed == searches_attempted:
+        error = CollectionUnavailableError(failures, searches_attempted)
+        cause = next((item.error for item in failures if item.error is not None), None)
+        if cause is not None:
+            raise error from cause
+        raise error
+    return ResearchExecution(gap_report, gap_report.rounds, sources_collected, evidence_extracted, failures,
+        searches_attempted, searches_succeeded, searches_failed)
