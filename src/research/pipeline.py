@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass,field
 
 from src.research.budget import SearchBudget
 from src.research.collection import collect_plan_sources
@@ -8,7 +8,7 @@ from src.research.extraction import extract_candidate
 from src.research.gaps import ResearchGapReport, evaluate_research_gaps
 from src.research.models import ResearchPlan, VerificationStatus
 from src.research.planner import ResearchProviderError
-from src.research.search import CollectionFailure, SearchOrchestrator
+from src.research.search import CollectionFailure, SearchAttempt, SearchOrchestrator
 from src.research.storage import ResearchStore
 from src.research.verification import verify_candidate
 
@@ -23,6 +23,7 @@ class ResearchExecution:
     searches_attempted: int = 0
     searches_succeeded: int = 0
     searches_failed: int = 0
+    search_attempts: list[SearchAttempt] = field(default_factory=list)
 
 
 class CollectionUnavailableError(RuntimeError):
@@ -66,6 +67,7 @@ def run_gap_research(
     searches_attempted = 0
     searches_succeeded = 0
     searches_failed = 0
+    search_attempts: list[SearchAttempt] = []
     current_questions = list(plan.questions)
     gap_report = evaluate_research_gaps(current_questions, [], [], min_independent_sources=min_independent_sources)
 
@@ -79,6 +81,7 @@ def run_gap_research(
         searches_attempted += collected.searches_attempted
         searches_succeeded += collected.searches_succeeded
         searches_failed += collected.searches_failed
+        search_attempts.extend(collected.attempts)
         _, _, _, prior_evidence = store.get_run_records(plan.run_id)
         already_verified={(item.question_id,item.source_id) for item in prior_evidence
             if item.verification_status == VerificationStatus.VERIFIED}
@@ -124,4 +127,4 @@ def run_gap_research(
             raise error from cause
         raise error
     return ResearchExecution(gap_report, gap_report.rounds, sources_collected, evidence_extracted, failures,
-        searches_attempted, searches_succeeded, searches_failed)
+        searches_attempted, searches_succeeded, searches_failed, search_attempts)

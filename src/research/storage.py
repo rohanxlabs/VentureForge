@@ -644,6 +644,21 @@ class ResearchStore:
         note: str | None = None, reason: str | None = None,
         _expected_from: set[ProjectStageStatus] | None = None,
     ) -> ProjectStage:
+        with self.db() as c:
+            c.execute("BEGIN IMMEDIATE")
+            self._transition_project_stage_in_transaction(
+                c, project_id, stage_key, to_status, actor=actor, note=note,
+                reason=reason, expected_from=_expected_from,
+            )
+        return self.get_project_stage(project_id, self._stage_key(stage_key))
+
+    def _transition_project_stage_in_transaction(
+        self, c: sqlite3.Connection, project_id: str, stage_key: str | ProjectStageKey,
+        to_status: str | ProjectStageStatus, *, actor: str = "user",
+        note: str | None = None, reason: str | None = None,
+        expected_from: set[ProjectStageStatus] | None = None,
+    ) -> ProjectStage:
+        """Apply the standard stage rules using a caller-owned transaction."""
         key = self._stage_key(stage_key)
         try:
             target = ProjectStageStatus(to_status)
@@ -655,36 +670,36 @@ class ResearchStore:
             raise ValueError("A non-empty reason is required to skip a stage.")
 
         now = datetime.now(timezone.utc).isoformat()
-        with self.db() as c:
-            c.execute("BEGIN IMMEDIATE")
-            project = self._project_row(c, project_id)
-            if project["status"] == ProjectStatus.ARCHIVED.value:
-                raise ValueError("Archived projects cannot transition stages.")
-            row = c.execute("SELECT * FROM project_stages WHERE project_id=? AND stage_key=?",
-                            (project_id, key.value)).fetchone()
-            if row is None:
-                raise KeyError(f"Stage {key.value} is not initialized for project {project_id}.")
-            current = ProjectStageStatus(row["status"])
-            if _expected_from is not None and current not in _expected_from:
-                allowed = ", ".join(sorted(status.value for status in _expected_from))
-                raise ValueError(f"Stage {key.value} must be in {allowed} for this operation; it is {current.value}.")
-            if target not in _STAGE_TRANSITIONS[current]:
-                raise ValueError(f"Invalid stage transition for {key.value}: {current.value} -> {target.value}.")
+        project = self._project_row(c, project_id)
+        if project["status"] == ProjectStatus.ARCHIVED.value:
+            raise ValueError("Archived projects cannot transition stages.")
+        row = c.execute("SELECT * FROM project_stages WHERE project_id=? AND stage_key=?",
+                        (project_id, key.value)).fetchone()
+        if row is None:
+            raise KeyError(f"Stage {key.value} is not initialized for project {project_id}.")
+        current = ProjectStageStatus(row["status"])
+        if expected_from is not None and current not in expected_from:
+            allowed = ", ".join(sorted(status.value for status in expected_from))
+            raise ValueError(f"Stage {key.value} must be in {allowed} for this operation; it is {current.value}.")
+        if target not in _STAGE_TRANSITIONS[current]:
+            raise ValueError(f"Invalid stage transition for {key.value}: {current.value} -> {target.value}.")
 
-            transition_note = reason.strip() if target == ProjectStageStatus.SKIPPED else (note or "").strip()
-            if current in {ProjectStageStatus.COMPLETED, ProjectStageStatus.SKIPPED} and target == ProjectStageStatus.IN_PROGRESS and not transition_note:
-                transition_note = "Explicitly reopened."
-            started_at = row["started_at"] or now if target == ProjectStageStatus.IN_PROGRESS else row["started_at"]
-            completed_at = now if target == ProjectStageStatus.COMPLETED else None
-            c.execute("""UPDATE project_stages SET status=?,started_at=?,completed_at=?,updated_at=?
-                WHERE project_id=? AND stage_key=? AND status=?""",
-                (target.value, started_at, completed_at, now, project_id, key.value, current.value))
-            c.execute("""INSERT INTO project_stage_history
-                (history_id,project_id,stage_key,from_status,to_status,changed_at,actor,note)
-                VALUES(?,?,?,?,?,?,?,?)""",
-                (str(uuid4()), project_id, key.value, current.value, target.value, now, actor.strip(), transition_note))
-            self._recalculate_project_stage_state(c, project_id, now)
-        return self.get_project_stage(project_id, key)
+        transition_note = reason.strip() if target == ProjectStageStatus.SKIPPED else (note or "").strip()
+        if current in {ProjectStageStatus.COMPLETED, ProjectStageStatus.SKIPPED} and target == ProjectStageStatus.IN_PROGRESS and not transition_note:
+            transition_note = "Explicitly reopened."
+        started_at = row["started_at"] or now if target == ProjectStageStatus.IN_PROGRESS else row["started_at"]
+        completed_at = now if target == ProjectStageStatus.COMPLETED else None
+        c.execute("""UPDATE project_stages SET status=?,started_at=?,completed_at=?,updated_at=?
+            WHERE project_id=? AND stage_key=? AND status=?""",
+            (target.value, started_at, completed_at, now, project_id, key.value, current.value))
+        c.execute("""INSERT INTO project_stage_history
+            (history_id,project_id,stage_key,from_status,to_status,changed_at,actor,note)
+            VALUES(?,?,?,?,?,?,?,?)""",
+            (str(uuid4()), project_id, key.value, current.value, target.value, now, actor.strip(), transition_note))
+        self._recalculate_project_stage_state(c, project_id, now)
+        updated = c.execute("SELECT * FROM project_stages WHERE project_id=? AND stage_key=?",
+                            (project_id, key.value)).fetchone()
+        return ProjectStage.model_validate(dict(updated))
 
     def start_project_stage(self, project_id: str, stage_key: str | ProjectStageKey, *, actor: str = "user") -> ProjectStage:
         return self.transition_project_stage(project_id, stage_key, ProjectStageStatus.IN_PROGRESS,

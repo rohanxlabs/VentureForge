@@ -119,17 +119,19 @@ class ProjectStageTests(unittest.TestCase):
 
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            self.assertIsNone(research_cli.main(["project", "stage", "start", self.project.project_id, "P1",
+            # P1/P2 have stage-specific artifact gates; cover generic transitions
+            # on P3 and cover P1/P2 gates in their own service tests.
+            self.assertIsNone(research_cli.main(["project", "stage", "start", self.project.project_id, "P3",
                                                  "--database", str(self.database)]))
-            self.assertIsNone(research_cli.main(["project", "stage", "complete", self.project.project_id, "P1",
+            self.assertIsNone(research_cli.main(["project", "stage", "complete", self.project.project_id, "P3",
                                                  "--database", str(self.database)]))
-            self.assertIsNone(research_cli.main(["project", "stage", "history", self.project.project_id, "P1",
+            self.assertIsNone(research_cli.main(["project", "stage", "history", self.project.project_id, "P3",
                                                  "--database", str(self.database)]))
-        self.assertIn("P1 complete: completed", output.getvalue())
+        self.assertIn("P3 complete: completed", output.getvalue())
         self.assertIn("in_progress -> completed", output.getvalue())
         errors = io.StringIO()
         with contextlib.redirect_stderr(errors):
-            result = research_cli.main(["project", "stage", "complete", self.project.project_id, "P2",
+            result = research_cli.main(["project", "stage", "complete", self.project.project_id, "P3",
                                         "--database", str(self.database)])
         self.assertEqual(result, 2)
         self.assertIn("must be in in_progress", errors.getvalue())

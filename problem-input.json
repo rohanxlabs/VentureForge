@@ -1,0 +1,104 @@
+
+{
+  "title": "Lack of structure, mentorship and career guidance after formal education",
+  "description": "People transitioning out of formal education often struggle to navigate their next career or learning stage because they lack structured guidance, accessible mentorship and clear pathways toward meaningful opportunities.",
+  "domain": "Education, career development and workforce transition",
+  "environment": "Transition from formal education to employment, higher education, entrepreneurship or independent skill development",
+  "geography": null,
+  "hackathon_theme": null,
+  "additional_context": "This is an exploratory problem. The affected population, root causes, severity and best intervention are not yet validated.",
+  "primary_users": [
+    "People who have recently completed formal education",
+    "People who have discontinued formal education"
+  ],
+  "secondary_users": [
+    "Career mentors",
+    "Employers",
+    "Educational institutions",
+    "Career counsellors",
+    "Skill-development organisations"
+  ],
+  "stakeholders": [
+    "Students and recent graduates",
+    "People who have discontinued education",
+    "Employers and recruiters",
+    "Mentors and career counsellors",
+    "Training providers"
+  ],
+  "buyer_or_decision_maker": null,
+  "current_process": [
+    "People independently search for career options and learning resources",
+    "People may seek advice from friends, family, teachers or online communities",
+    "People attempt to identify and follow a learning or career path"
+  ],
+  "where_it_occurs": "During the transition from formal education into the next stage of personal and professional development",
+  "when_it_occurs": "After graduation, school completion or discontinuation of formal education",
+  "frequency": null,
+  "existing_tools": [
+    "Online learning platforms",
+    "Career guidance websites",
+    "Job portals",
+    "Professional networking platforms",
+    "Online communities"
+  ],
+  "workarounds": [
+    "Searching for career advice online",
+    "Following courses and tutorials independently",
+    "Asking friends, family or teachers for guidance",
+    "Using job portals to explore career options",
+    "Seeking informal mentorship"
+  ],
+  "pain_points": [
+    "Uncertainty about what to do next",
+    "Difficulty identifying suitable career paths",
+    "Lack of a structured learning or development roadmap",
+    "Limited access to relevant mentorship",
+    "Difficulty connecting learning activities with career opportunities",
+    "Difficulty maintaining consistency and accountability"
+  ],
+  "root_cause_hypotheses": [
+    "Formal education may not provide sufficient transition support after completion or discontinuation",
+    "Career information may be fragmented across multiple platforms",
+    "Affordable and relevant mentorship may be difficult to access",
+    "People may lack personalised guidance based on their interests, skills and circumstances",
+    "Learning resources may not clearly connect to employment or other career outcomes"
+  ],
+  "existing_alternatives": [
+    "Career counselling",
+    "Online learning platforms",
+    "Mentorship communities",
+    "Job portals",
+    "Professional networking platforms",
+    "Government and private skill-development programmes"
+  ],
+  "alternative_limitations": [],
+  "measured_impacts": [],
+  "qualitative_consequences": [
+    "Career confusion",
+    "Uncertainty and frustration",
+    "Unstructured learning",
+    "Difficulty making informed career decisions",
+    "Potential delays in career progression"
+  ],
+  "constraints": [
+    "Different users may have different educational backgrounds and career goals",
+    "Mentorship availability and affordability may vary",
+    "Career guidance must account for local job markets and opportunities",
+    "A proposed solution should not assume that everyone needs the same career path"
+  ],
+  "assumptions": [
+    "The transition out of formal education creates a meaningful guidance gap for at least some people",
+    "Some affected people would benefit from structured pathways and mentorship",
+    "The problem may affect graduates and people who discontinue education differently"
+  ],
+  "unknowns": [
+    "Which user segment experiences the most severe problem?",
+    "How frequently does the problem occur?",
+    "What do affected people currently do to overcome it?",
+    "Which existing solutions fail, and why?",
+    "Is the main barrier structure, mentorship, career information or access to opportunities?",
+    "Would users actually use or pay for a solution?",
+    "Which outcomes would demonstrate that the problem has been meaningfully solved?",
+    "Does the problem differ significantly across geography, education level and economic background?"
+  ]
+}

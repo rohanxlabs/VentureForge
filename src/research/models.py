@@ -372,6 +372,17 @@ class ResearchQuestion(BaseModel):
     evidence_required:str=""
     decision_impact:str=""
     status:Literal["pending","in_progress","covered","blocked"]="pending"
+    # Project-planning metadata; kept in the versioned plan JSON for compatibility
+    # with the established relational question schema.
+    plan_id:str|None=None
+    project_id:str|None=None
+    objective:str=""
+    problem_dimension:str="other"
+    priority_rationale:str=""
+    geographic_scope:str|None=None
+    time_scope:str|None=None
+    expected_answer_type:str="qualitative"
+    limitations:list[str]=Field(default_factory=list)
 
 class QuestionDraft(BaseModel):
     text:str=Field(min_length=8)
@@ -398,6 +409,15 @@ class ResearchPlan(BaseModel):
     status:Literal["draft","approved","rejected"]="draft"
     created_at:datetime=Field(default_factory=lambda:datetime.now(timezone.utc))
     approved_at:datetime|None=None
+    objectives:list[str]=Field(default_factory=list)
+    research_scope:list[str]=Field(default_factory=list)
+    known_limitations:list[str]=Field(default_factory=list)
+    expected_outputs:list[str]=Field(default_factory=list)
+    search_budget:dict[str,int|float]=Field(default_factory=lambda:{"max_search_calls":8,"max_pages":20,"max_tavily_credits":8,"max_seconds":180})
+    unresolved_assumptions:list[str]=Field(default_factory=list)
+    problem_frame_artifact_id:str|None=None
+    problem_frame_version:int|None=None
+    planning_method:Literal["deterministic_from_problem_frame","configured_llm"]="deterministic_from_problem_frame"
 
 class SourceSnapshot(BaseModel):
     id:str=Field(default_factory=lambda:str(uuid4()))

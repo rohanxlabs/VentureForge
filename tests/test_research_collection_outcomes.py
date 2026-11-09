@@ -108,6 +108,17 @@ class CollectionOutcomeTests(unittest.TestCase):
             self.assertEqual((result.searches_attempted, result.searches_succeeded, result.searches_failed), (6, 6, 0))
             self.assertEqual(result.sources, [])
             self.assertEqual(result.failures, [])
+            self.assertEqual(len(result.attempts), 6)
+            self.assertTrue(all(item.status == "succeeded" and item.source_count == 0
+                                and item.query and item.connector for item in result.attempts))
+
+    def test_failed_connector_attempt_records_identity_query_and_error(self):
+        plan = make_plan()
+        result = self._collect(plan, None, orchestrator(tavily_fails=True))
+        failed = [item for item in result.attempts if item.status == "failed"]
+        self.assertEqual(len(failed), 3)
+        self.assertTrue(all(item.connector == "tavily" and item.query and item.error
+                            and item.elapsed_seconds >= 0 for item in failed))
 
     def test_collect_cli_labels_successful_zero_result_search(self):
         plan = make_plan()

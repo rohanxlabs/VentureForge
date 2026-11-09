@@ -83,12 +83,20 @@ def _parser():
     pitch.add_argument("--output",default=None)
     project=commands.add_parser("project",help="Manage persistent hackathon projects.")
     project_commands=project.add_subparsers(dest="project_command",required=True)
-    problem=project_commands.add_parser("problem",help="Manage project problem intelligence (P1-P3).")
+    problem=project_commands.add_parser("problem",help="Manage P1 problem framing and existing later-stage workflows.")
     problem_commands=problem.add_subparsers(dest="problem_command",required=True)
+    problem_start=problem_commands.add_parser("start",help="Start P1 problem framing for an existing project.")
+    problem_start.add_argument("project_id"); problem_start.add_argument("--database",default="data/research.sqlite")
     frame=problem_commands.add_parser("frame",help="Create a P1 frame from a JSON file of structured user input.")
-    frame.add_argument("project_id"); frame.add_argument("input_json"); frame.add_argument("--database",default="data/research.sqlite")
+    frame.add_argument("project_id"); frame.add_argument("input_json"); frame.add_argument("--ai",action="store_true",help="Use the configured LLM to interpret and structure the input."); frame.add_argument("--database",default="data/research.sqlite")
+    revise=problem_commands.add_parser("revise",help="Create a new P1 Problem Frame version from revised JSON input.")
+    revise.add_argument("project_id"); revise.add_argument("input_json"); revise.add_argument("--ai",action="store_true"); revise.add_argument("--database",default="data/research.sqlite")
     frame_show=problem_commands.add_parser("show-frame",help="Show the latest problem frame.")
     frame_show.add_argument("project_id"); frame_show.add_argument("--database",default="data/research.sqlite")
+    problem_review=problem_commands.add_parser("review",help="Display the latest P1 frame and its review state.")
+    problem_review.add_argument("project_id"); problem_review.add_argument("--database",default="data/research.sqlite")
+    problem_status=problem_commands.add_parser("status",help="Show P1 status, latest artifact, approval and stage history.")
+    problem_status.add_argument("project_id"); problem_status.add_argument("--database",default="data/research.sqlite")
     frame_approve=problem_commands.add_parser("approve-frame",help="Record human approval or request changes for a P1 frame.")
     frame_approve.add_argument("project_id"); frame_approve.add_argument("artifact_id"); frame_approve.add_argument("decision_id")
     frame_approve.add_argument("--status",choices=["approved","changes_requested","rejected"],required=True)
@@ -244,6 +252,32 @@ def _parser():
     project_research_commands=project_research.add_subparsers(dest="project_research_command",required=True)
     research_list=project_research_commands.add_parser("list"); research_list.add_argument("project_id"); research_list.add_argument("--database",default="data/research.sqlite")
     research_attach=project_research_commands.add_parser("attach"); research_attach.add_argument("project_id"); research_attach.add_argument("run_id"); research_attach.add_argument("--database",default="data/research.sqlite")
+    p2_plan=project_research_commands.add_parser("plan",help="Create a research plan from the latest approved Problem Frame.")
+    p2_plan.add_argument("project_id"); p2_plan.add_argument("--ai",action="store_true",help="Use the configured structured planner for draft research questions."); p2_plan.add_argument("--database",default="data/research.sqlite")
+    p2_revise=project_research_commands.add_parser("plan-revise",help="Save an edited plan JSON as a new draft version.")
+    p2_revise.add_argument("project_id"); p2_revise.add_argument("--input",required=True,help="Path to edited plan JSON from plan-show."); p2_revise.add_argument("--database",default="data/research.sqlite")
+    for command,help_text in (("plan-show","Show the latest research plan."),("status","Show project P2 status."),
+        ("sources","List sources from the latest approved plan run."),("findings","List extracted evidence records."),
+        ("coverage","Show question coverage."),("gaps","Show unresolved research gaps."),("report","Show the latest P2 report.")):
+        p=project_research_commands.add_parser(command,help=help_text)
+        p.add_argument("project_id"); p.add_argument("--database",default="data/research.sqlite")
+        if command=="plan-show": p.add_argument("--output",help="Write editable plan JSON to this path.")
+    p2_plan_approve=project_research_commands.add_parser("plan-approve",help="Approve or request changes to a research plan.")
+    p2_plan_approve.add_argument("project_id"); p2_plan_approve.add_argument("artifact_id")
+    p2_plan_approve.add_argument("--status",choices=["approved","changes_requested","rejected"],default="approved")
+    p2_plan_approve.add_argument("--comment",default=""); p2_plan_approve.add_argument("--actor",default="user"); p2_plan_approve.add_argument("--database",default="data/research.sqlite")
+    p2_run=project_research_commands.add_parser("run",help="Run bounded research for the latest approved plan.")
+    p2_run.add_argument("project_id"); p2_run.add_argument("--max-searches",type=int,default=8)
+    p2_run.add_argument("--max-pages",type=int,default=20); p2_run.add_argument("--max-tavily-credits",type=int,default=8)
+    p2_run.add_argument("--max-seconds",type=float,default=180); p2_run.add_argument("--max-rounds",type=int,default=2)
+    p2_run.add_argument("--workers",type=int,default=4); p2_run.add_argument("--database",default="data/research.sqlite")
+    p2_report_approve=project_research_commands.add_parser("report-approve",help="Approve the latest P2 research report and complete P2.")
+    p2_report_approve.add_argument("project_id"); p2_report_approve.add_argument("artifact_id")
+    p2_report_approve.add_argument("--comment",default=""); p2_report_approve.add_argument("--actor",default="user"); p2_report_approve.add_argument("--database",default="data/research.sqlite")
+    p2_changes=project_research_commands.add_parser("request-changes",help="Request changes to a P2 plan or report.")
+    p2_changes.add_argument("project_id"); p2_changes.add_argument("artifact_id")
+    p2_changes.add_argument("--artifact-type",choices=["research_plan","research_report"],required=True)
+    p2_changes.add_argument("--comment",required=True); p2_changes.add_argument("--actor",default="user"); p2_changes.add_argument("--database",default="data/research.sqlite")
     return parser
 
 def main(argv=None):
@@ -311,18 +345,43 @@ def _dispatch(args):
     if args.command=="project":
         store=ProjectStore(args.database)
         if args.project_command=="problem":
-            from src.problem_intelligence import (ProblemInput, ProblemFrame, create_frame, save_frame,
+            from src.problem_intelligence import (ProblemInput, ProblemFrame, create_frame, generate_frame, save_frame,
                 create_research_plan, assess_problem, save_assessment, approve_frame, approve_assessment)
-            if args.problem_command=="frame":
-                payload=json.loads(Path(args.input_json).read_text(encoding="utf-8"))
-                artifact,decision=save_frame(store,args.project_id,create_frame(ProblemInput.model_validate(payload)))
-                print(f"Saved P1 frame draft: {artifact.artifact_id}; decision: {decision.decision_id}")
+            if args.problem_command=="start":
+                from src.problem_intelligence import start_problem_framing
+                stage=start_problem_framing(store,args.project_id)
+                print(f"P1 status: {stage.status.value}")
                 return
-            if args.problem_command=="show-frame":
-                items=[a for a in store.list_project_artifacts(args.project_id) if a.artifact_type=="problem_frame"]
-                if not items: raise ValueError("No problem frame found.")
-                print(json.dumps(json.loads(items[-1].content),indent=2,ensure_ascii=False))
-                print(f"Artifact: {items[-1].artifact_id} v{items[-1].version}; approval: {store.get_artifact_approval_status(args.project_id,items[-1].artifact_id)}")
+            if args.problem_command in {"frame", "revise"}:
+                payload=json.loads(Path(args.input_json).read_text(encoding="utf-8"))
+                problem_input=ProblemInput.model_validate(payload)
+                framed=generate_frame(problem_input) if args.ai else create_frame(problem_input)
+                artifact,decision=save_frame(store,args.project_id,framed)
+                print(f"Saved P1 frame v{artifact.version}: {artifact.artifact_id}; decision: {decision.decision_id}")
+                return
+            if args.problem_command in {"show-frame", "review"}:
+                from src.problem_intelligence import latest_problem_frame
+                item=latest_problem_frame(store,args.project_id)
+                if item is None: raise ValueError("No problem frame found.")
+                print(json.dumps(json.loads(item.content),indent=2,ensure_ascii=False))
+                print(f"Artifact: {item.artifact_id} v{item.version}; decision: {item.decision_id or '(none)'}; approval: {store.get_artifact_approval_status(args.project_id,item.artifact_id)}")
+                if args.problem_command=="review":
+                    print("Review this version before recording approval or requesting changes.")
+                return
+            if args.problem_command=="status":
+                from src.problem_intelligence import latest_problem_frame
+                item=latest_problem_frame(store,args.project_id)
+                stage=store.get_project_stage(args.project_id,ProjectStageKey.P1)
+                print(f"Project: {args.project_id}\nP1: {stage.status.value}")
+                if item:
+                    state=store.get_artifact_approval_status(args.project_id,item.artifact_id)
+                    print(f"Problem Frame: {item.artifact_id} v{item.version}\nApproval: {state}")
+                    print("Pending action: review and approve" if state=="pending" else "Pending action: revise" if state=="changes_requested" else "Pending action: none")
+                    print("Approval history:")
+                    for event in store.get_artifact_approval_history(args.project_id,item.artifact_id): print(f"  {event.status.value}: {event.comment}")
+                else: print("Problem Frame: none\nPending action: add structured input and create a frame")
+                print("P1 stage history:")
+                for event in store.get_project_stage_history(args.project_id,ProjectStageKey.P1): print(f"  {event.from_status.value} -> {event.to_status.value}: {event.note}")
                 return
             if args.problem_command=="approve-frame":
                 result=approve_frame(store,args.project_id,args.artifact_id,args.decision_id,
@@ -335,21 +394,18 @@ def _dispatch(args):
                 for i,q in enumerate(plan.questions,1): print(f"{i}. [{q.priority.value}] {q.text}")
                 return
             if args.problem_command=="approve-plan":
-                from datetime import datetime, timezone
                 artifact=store.get_artifact(args.project_id,args.artifact_id)
                 if artifact.artifact_type!="research_plan" or artifact.stage_key!=ProjectStageKey.P2: raise ValueError("Artifact is not a P2 research plan.")
+                result=store.approve_p2_artifact(args.project_id,args.artifact_id,args.decision_id,
+                    "research_plan",ApprovalEventStatus.APPROVED)
                 plan=store.get_plan(json.loads(artifact.content)["id"])
-                store.update_plan(plan.model_copy(update={"status":"approved","approved_at":datetime.now(timezone.utc)}))
-                store.record_artifact_approval(args.project_id,args.artifact_id,ApprovalEventStatus.APPROVED)
-                store.record_decision_approval(args.project_id,args.decision_id,ApprovalEventStatus.APPROVED)
                 print(f"Approved research plan {plan.id}; research run: {plan.run_id}")
                 return
             if args.problem_command=="approve-report":
                 artifact=store.get_artifact(args.project_id,args.artifact_id)
                 if artifact.artifact_type!="research_report" or artifact.stage_key!=ProjectStageKey.P2: raise ValueError("Artifact is not a P2 research report.")
-                store.record_artifact_approval(args.project_id,args.artifact_id,ApprovalEventStatus.APPROVED)
-                store.record_decision_approval(args.project_id,args.decision_id,ApprovalEventStatus.APPROVED)
-                store.complete_project_stage(args.project_id,ProjectStageKey.P2,note="Research report approved by human.")
+                store.approve_p2_artifact(args.project_id,args.artifact_id,args.decision_id,
+                    "research_report",ApprovalEventStatus.APPROVED)
                 print(f"Approved research report {artifact.artifact_id}; P2 completed.")
                 return
             if args.problem_command=="assess":
@@ -482,6 +538,87 @@ def _dispatch(args):
             if args.project_research_command=="attach":
                 store.associate_research_run(args.project_id,args.run_id)
                 print(f"Associated research run {args.run_id} with project {args.project_id}.")
+                return
+            if args.project_research_command=="plan":
+                from src.problem_intelligence import create_research_plan
+                plan,artifact,decision=create_research_plan(store,args.project_id,use_llm=args.ai)
+                print(f"Saved P2 research plan v{artifact.version}: {artifact.artifact_id}; plan: {plan.id}; decision: {decision.decision_id}")
+                for objective in plan.objectives: print(f"Objective: {objective}")
+                for question in plan.questions:
+                    print(f"[{question.priority.value}] {question.text}\n  Why: {question.priority_rationale}\n  Evidence: {question.evidence_required}")
+                return
+            if args.project_research_command=="plan-revise":
+                from src.problem_intelligence import revise_research_plan
+                plan,artifact,decision=revise_research_plan(store,args.project_id,
+                    Path(args.input).read_text(encoding="utf-8"))
+                print(f"Saved revised P2 research plan v{artifact.version}: {artifact.artifact_id}; plan: {plan.id}; decision: {decision.decision_id}")
+                return
+            if args.project_research_command=="plan-show":
+                from src.research.project_intelligence import _latest_artifact
+                artifact=_latest_artifact(store,args.project_id,"research_plan")
+                if artifact is None: raise ValueError("No P2 research plan exists for this project.")
+                plan=store.get_plan(json.loads(artifact.content)["id"])
+                if args.output:
+                    Path(args.output).write_text(plan.model_dump_json(indent=2),encoding="utf-8")
+                    print(f"Wrote editable plan JSON: {args.output}")
+                    return
+                print(json.dumps(plan.model_dump(mode="json"),indent=2,ensure_ascii=False))
+                print(f"Artifact: {artifact.artifact_id} v{artifact.version}; approval: {store.get_artifact_approval_status(args.project_id,artifact.artifact_id)}")
+                return
+            if args.project_research_command=="plan-approve":
+                artifact=store.get_artifact(args.project_id,args.artifact_id)
+                if not artifact.decision_id: raise ValueError("Research plan has no linked decision.")
+                event=store.approve_p2_artifact(args.project_id,args.artifact_id,artifact.decision_id,
+                    "research_plan",ApprovalEventStatus(args.status),actor=args.actor,comment=args.comment)
+                print(f"Recorded P2 plan {event.status.value}: {event.approval_id}")
+                return
+            if args.project_research_command=="run":
+                require_llm_configuration(settings.get_llm_config(reasoning=False))
+                budget=SearchBudget(max_search_calls=args.max_searches,max_pages=args.max_pages,
+                    max_tavily_credits=args.max_tavily_credits,max_seconds=args.max_seconds)
+                tavily=TavilyConnector(settings.tavily_api_key) if settings.tavily_api_key else None
+                orchestrator=SearchOrchestrator(tavily,HackerNewsConnector(),fetcher=SafeFetcher(),max_workers=args.workers)
+                from src.research.project_intelligence import execute_project_research
+                execution,artifact,decision,workflow=execute_project_research(store,args.project_id,
+                    budget=budget,orchestrator=orchestrator,max_rounds=args.max_rounds)
+                print(f"P2 research {workflow.status.value}; report: {artifact.artifact_id}; decision: {decision.decision_id}")
+                print(f"Searches: {execution.searches_succeeded}/{execution.searches_attempted} succeeded; sources: {execution.sources_collected}; evidence: {execution.evidence_extracted}; rounds: {execution.rounds_run}")
+                print("Coverage: " + ("complete by configured heuristic" if execution.gap_report.complete else "gaps remain"))
+                return
+            if args.project_research_command=="status":
+                from src.research.project_intelligence import p2_status
+                print(json.dumps(p2_status(store,args.project_id),indent=2,ensure_ascii=False))
+                return
+            if args.project_research_command in {"sources","findings","coverage","gaps"}:
+                from src.research.project_intelligence import project_research_records
+                category="findings" if args.project_research_command=="findings" else args.project_research_command
+                value=project_research_records(store,args.project_id,category=category)
+                if category in {"sources","findings"}:
+                    rows=[item.model_dump(mode="json") for item in value]
+                else:
+                    rows={"complete_by_heuristic":value.complete,"rounds":value.rounds,
+                        "questions":[item.__dict__ for item in value.questions],
+                        "potential_disagreements":value.potential_disagreements}
+                print(json.dumps(rows,indent=2,ensure_ascii=False))
+                return
+            if args.project_research_command=="report":
+                from src.research.project_intelligence import report_document
+                artifact,data=report_document(store,args.project_id)
+                print(f"Report: {artifact.artifact_id} v{artifact.version}; approval: {store.get_artifact_approval_status(args.project_id,artifact.artifact_id)}\n")
+                print(data.get("markdown", ""))
+                return
+            if args.project_research_command in {"report-approve","request-changes"}:
+                artifact=store.get_artifact(args.project_id,args.artifact_id)
+                artifact_type=("research_report" if args.project_research_command=="report-approve"
+                               else args.artifact_type)
+                if artifact.decision_id is None: raise ValueError("P2 artifact has no linked decision.")
+                status=(ApprovalEventStatus.APPROVED if args.project_research_command=="report-approve"
+                        else ApprovalEventStatus.CHANGES_REQUESTED)
+                event=store.approve_p2_artifact(args.project_id,args.artifact_id,artifact.decision_id,
+                    artifact_type,status,actor=args.actor,comment=getattr(args,"comment",""))
+                print(f"Recorded P2 {event.status.value}: {event.approval_id}")
+                if artifact_type=="research_report" and status==ApprovalEventStatus.APPROVED:
+                    print("P2 completed.")
                 return
             items=store.list_project_research_runs(args.project_id)
             if not items: print("No project research runs found.")

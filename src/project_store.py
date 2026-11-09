@@ -9,9 +9,9 @@ from src.research.models import (
     ApprovalEvent, ApprovalEventStatus, DecisionCreate, DecisionEvidenceLink,
     DecisionEvidenceRelationship, DecisionOption, DecisionOptionCreate,
     DecisionUpdate, ProjectDecision, ProjectStatus,
-    ArtifactCreate, ArtifactStatus, ProjectArtifact, ProjectStageKey,
+    ArtifactCreate, ArtifactStatus, ProjectArtifact, ProjectStageKey, ProjectStageStatus,
     ProjectWorkflowRun, WorkflowRunCreate, WorkflowRunEvent, WorkflowStatus,
-    ProjectResearchRunSummary,
+    ProjectResearchRunSummary, ResearchPlan,
 )
 from src.research.storage import ResearchStore
 
@@ -26,6 +26,465 @@ class ProjectStore(ResearchStore):
         ArtifactStatus.SUPERSEDED: {ArtifactStatus.ARCHIVED},
         ArtifactStatus.ARCHIVED: set(),
     }
+
+    @staticmethod
+    def _insert_approval_event(c, *, project_id: str, status: ApprovalEventStatus,
+                               actor: str, comment: str, decision_id: str | None = None,
+                               artifact_id: str | None = None) -> ApprovalEvent:
+        sequence = c.execute("SELECT COALESCE(MAX(event_sequence),0)+1 FROM approval_events").fetchone()[0]
+        event = ApprovalEvent(project_id=project_id, decision_id=decision_id, artifact_id=artifact_id,
+                              status=status, actor=actor, comment=comment, event_sequence=sequence)
+        c.execute("""INSERT INTO approval_events
+            (approval_id,event_sequence,project_id,decision_id,artifact_id,status,actor,comment,created_at)
+            VALUES(?,?,?,?,?,?,?,?,?)""",
+            (event.approval_id, sequence, project_id, decision_id, artifact_id, status.value,
+             actor, comment, event.created_at.isoformat()))
+        return event
+
+    @staticmethod
+    def _latest_approval_event(c, *, project_id: str, decision_id: str | None = None,
+                               artifact_id: str | None = None):
+        if (decision_id is None) == (artifact_id is None):
+            raise ValueError("Specify exactly one decision or artifact for approval history lookup.")
+        field, value = ("decision_id", decision_id) if decision_id is not None else ("artifact_id", artifact_id)
+        row = c.execute(f"SELECT * FROM approval_events WHERE project_id=? AND {field}=? ORDER BY event_sequence DESC LIMIT 1",
+                         (project_id, value)).fetchone()
+        return ApprovalEvent.model_validate(dict(row)) if row else None
+
+    def _p1_approval_checkpoint(self, point: str, connection) -> None:
+        """Test seam for proving rollback at transaction boundaries."""
+
+    def approve_problem_frame(self, project_id: str, artifact_id: str, decision_id: str,
+                              status: ApprovalEventStatus, *, actor: str = "user", comment: str = "") -> ApprovalEvent:
+        """Atomically record a P1 frame decision and transition P1 when accepted."""
+        status = ApprovalEventStatus(status)
+        if status not in {ApprovalEventStatus.APPROVED, ApprovalEventStatus.CHANGES_REQUESTED,
+                          ApprovalEventStatus.REJECTED}:
+            raise ValueError("P1 review status must be approved, changes_requested, or rejected.")
+        if not actor.strip():
+            raise ValueError("Approval actor cannot be empty.")
+        actor = actor.strip()
+        with self.db() as c:
+            c.execute("BEGIN IMMEDIATE")
+            self._p1_approval_checkpoint("before_writes", c)
+            project = self._require_project(c, project_id, writable=True)
+            if project["status"] != ProjectStatus.ACTIVE.value:
+                raise ValueError("Problem Frames can only be approved for active projects.")
+            artifact = c.execute("""SELECT * FROM project_artifacts
+                WHERE project_id=? AND artifact_id=?""", (project_id, artifact_id)).fetchone()
+            if artifact is None:
+                raise KeyError(f"Artifact {artifact_id} does not belong to project {project_id}.")
+            if artifact["stage_key"] != ProjectStageKey.P1.value or artifact["artifact_type"] != "problem_frame":
+                raise ValueError("Artifact is not a P1 Problem Frame.")
+            latest = c.execute("""SELECT artifact_id FROM project_artifacts
+                WHERE project_id=? AND stage_key='P1' AND artifact_type='problem_frame'
+                ORDER BY created_at DESC, version DESC, artifact_id DESC LIMIT 1""", (project_id,)).fetchone()
+            if latest is None or latest["artifact_id"] != artifact_id:
+                raise ValueError("Only the latest Problem Frame version can be reviewed or approved.")
+            if artifact["status"] not in {ArtifactStatus.DRAFT.value, ArtifactStatus.READY.value}:
+                raise ValueError("Only a draft or ready Problem Frame can be reviewed.")
+            decision = c.execute("SELECT * FROM decisions WHERE project_id=? AND decision_id=?",
+                                 (project_id, decision_id)).fetchone()
+            if decision is None:
+                raise KeyError(f"Decision {decision_id} does not belong to project {project_id}.")
+            if decision["stage_key"] != ProjectStageKey.P1.value or artifact["decision_id"] != decision_id:
+                raise ValueError("Approval decision is not linked to this P1 Problem Frame.")
+            stage = c.execute("SELECT status FROM project_stages WHERE project_id=? AND stage_key='P1'",
+                              (project_id,)).fetchone()
+            if stage is None:
+                raise KeyError(f"Stage P1 is not initialized for project {project_id}.")
+            current = ProjectStageStatus(stage["status"])
+            artifact_prior = self._latest_approval_event(c, project_id=project_id, artifact_id=artifact_id)
+            decision_prior = self._latest_approval_event(c, project_id=project_id, decision_id=decision_id)
+
+            # A fully committed repeat is idempotent. A split/legacy partial state is surfaced.
+            if (artifact_prior and decision_prior and artifact_prior.status == decision_prior.status
+                    and artifact_prior.status == status):
+                if status == ApprovalEventStatus.APPROVED and current == ProjectStageStatus.COMPLETED:
+                    return artifact_prior
+                if status != ApprovalEventStatus.APPROVED and current == ProjectStageStatus.IN_PROGRESS:
+                    return artifact_prior
+                raise RuntimeError("P1 approval history and stage status are inconsistent; inspect before retrying.")
+            if ((artifact_prior is None) != (decision_prior is None) or
+                    (artifact_prior and decision_prior and artifact_prior.status != decision_prior.status)):
+                raise RuntimeError("P1 approval history is inconsistent; inspect existing approval events before retrying.")
+            if status == ApprovalEventStatus.APPROVED and current != ProjectStageStatus.IN_PROGRESS:
+                raise ValueError(f"P1 must be in in_progress before approval; it is {current.value}.")
+            if status != ApprovalEventStatus.APPROVED and current not in {
+                    ProjectStageStatus.IN_PROGRESS, ProjectStageStatus.COMPLETED}:
+                raise ValueError(f"P1 review requires in_progress or completed status; it is {current.value}.")
+
+            artifact_event = self._insert_approval_event(c, project_id=project_id, artifact_id=artifact_id,
+                status=status, actor=actor, comment=comment)
+            self._p1_approval_checkpoint("after_artifact_approval", c)
+            self._insert_approval_event(c, project_id=project_id, decision_id=decision_id,
+                status=status, actor=actor, comment=comment)
+            self._p1_approval_checkpoint("after_decision_approval", c)
+            if status == ApprovalEventStatus.APPROVED:
+                self._p1_approval_checkpoint("before_stage_completion", c)
+                self._transition_project_stage_in_transaction(c, project_id, ProjectStageKey.P1,
+                    ProjectStageStatus.COMPLETED, actor=actor, note="Problem frame approved by human.",
+                    expected_from={ProjectStageStatus.IN_PROGRESS})
+            elif current == ProjectStageStatus.COMPLETED:
+                self._transition_project_stage_in_transaction(c, project_id, ProjectStageKey.P1,
+                    ProjectStageStatus.IN_PROGRESS, actor=actor,
+                    note=("A review rejected the Problem Frame." if status == ApprovalEventStatus.REJECTED
+                          else "A review requested changes to the Problem Frame."),
+                    expected_from={ProjectStageStatus.COMPLETED, ProjectStageStatus.SKIPPED})
+            self._p1_approval_checkpoint("after_stage_transition", c)
+            self._p1_approval_checkpoint("before_commit", c)
+            return artifact_event
+
+    def approve_p2_artifact(self, project_id: str, artifact_id: str, decision_id: str,
+                            artifact_type: str, status: ApprovalEventStatus = ApprovalEventStatus.APPROVED,
+                            *, actor: str = "user", comment: str = "") -> ApprovalEvent:
+        """Atomically approve a P2 plan/report artifact and optionally complete P2."""
+        status = ApprovalEventStatus(status)
+        if status not in {ApprovalEventStatus.APPROVED, ApprovalEventStatus.CHANGES_REQUESTED,
+                          ApprovalEventStatus.REJECTED}:
+            raise ValueError("P2 review status must be approved, changes_requested, or rejected.")
+        if artifact_type not in {"research_plan", "research_report"}:
+            raise ValueError("Unsupported P2 artifact type.")
+        if not actor.strip():
+            raise ValueError("Approval actor cannot be empty.")
+        actor = actor.strip()
+        with self.db() as c:
+            c.execute("BEGIN IMMEDIATE")
+            self._p2_approval_checkpoint("before_writes", c)
+            project = self._require_project(c, project_id, writable=True)
+            if project["status"] != ProjectStatus.ACTIVE.value:
+                raise ValueError("P2 artifacts can only be approved for active projects.")
+            artifact = c.execute("SELECT * FROM project_artifacts WHERE project_id=? AND artifact_id=?",
+                                 (project_id, artifact_id)).fetchone()
+            if artifact is None:
+                raise KeyError(f"Artifact {artifact_id} does not belong to project {project_id}.")
+            if artifact["stage_key"] != ProjectStageKey.P2.value or artifact["artifact_type"] != artifact_type:
+                raise ValueError(f"Artifact is not a P2 {artifact_type.replace('_', ' ')}.")
+            latest = c.execute("""SELECT artifact_id FROM project_artifacts WHERE project_id=?
+                AND stage_key='P2' AND artifact_type=? ORDER BY created_at DESC,version DESC,artifact_id DESC LIMIT 1""",
+                (project_id, artifact_type)).fetchone()
+            if latest is None or latest["artifact_id"] != artifact_id:
+                raise ValueError(f"Only the latest {artifact_type.replace('_', ' ')} version can be reviewed.")
+            if artifact["status"] not in {ArtifactStatus.DRAFT.value, ArtifactStatus.READY.value}:
+                raise ValueError("Only a draft or ready P2 artifact can be reviewed.")
+            decision = c.execute("SELECT stage_key FROM decisions WHERE project_id=? AND decision_id=?",
+                                 (project_id, decision_id)).fetchone()
+            if decision is None:
+                raise KeyError(f"Decision {decision_id} does not belong to project {project_id}.")
+            if decision["stage_key"] != ProjectStageKey.P2.value or artifact["decision_id"] != decision_id:
+                raise ValueError("Approval decision is not linked to this P2 artifact.")
+            stage_row = c.execute("SELECT status FROM project_stages WHERE project_id=? AND stage_key='P2'",
+                                  (project_id,)).fetchone()
+            if stage_row is None:
+                raise KeyError(f"Stage P2 is not initialized for project {project_id}.")
+            stage = ProjectStageStatus(stage_row["status"])
+            artifact_prior = self._latest_approval_event(c, project_id=project_id, artifact_id=artifact_id)
+            decision_prior = self._latest_approval_event(c, project_id=project_id, decision_id=decision_id)
+            if artifact_prior and decision_prior and artifact_prior.status == decision_prior.status == status:
+                if artifact_type == "research_report" and status == ApprovalEventStatus.APPROVED and stage == ProjectStageStatus.COMPLETED:
+                    return artifact_prior
+                if not (artifact_type == "research_report" and status == ApprovalEventStatus.APPROVED):
+                    return artifact_prior
+                raise RuntimeError("P2 report approval history and stage state are inconsistent.")
+            if ((artifact_prior is None) != (decision_prior is None) or
+                    (artifact_prior and decision_prior and artifact_prior.status != decision_prior.status)):
+                raise RuntimeError("P2 approval history is inconsistent; inspect existing events before retrying.")
+
+            if artifact_type == "research_plan":
+                if stage != ProjectStageStatus.IN_PROGRESS:
+                    raise ValueError(f"P2 must be in in_progress to review a plan; it is {stage.value}.")
+                content = json.loads(artifact["content"] or "{}")
+                plan_id = content.get("id")
+                run_id = content.get("run_id")
+                row = c.execute("SELECT plan_json,status,run_id FROM research_plans WHERE plan_id=?",
+                                (plan_id,)).fetchone()
+                run = c.execute("SELECT project_id FROM research_runs WHERE id=?", (run_id,)).fetchone()
+                if row is None or row["run_id"] != run_id or run is None or run["project_id"] != project_id:
+                    raise ValueError("Research plan is not backed by a run owned by this project.")
+                plan_data = json.loads(row["plan_json"])
+                if (plan_data.get("problem_frame_artifact_id") != content.get("problem_frame_artifact_id") or
+                        plan_data.get("problem_frame_version") != content.get("problem_frame_version")):
+                    raise ValueError("Research plan artifact content does not match its persisted plan record.")
+                p1 = c.execute("SELECT status FROM project_stages WHERE project_id=? AND stage_key='P1'",
+                               (project_id,)).fetchone()
+                latest_frame = c.execute("""SELECT artifact_id,decision_id,status FROM project_artifacts
+                    WHERE project_id=? AND stage_key='P1' AND artifact_type='problem_frame'
+                    ORDER BY version DESC,created_at DESC LIMIT 1""", (project_id,)).fetchone()
+                if (p1 is None or p1["status"] != ProjectStageStatus.COMPLETED.value or
+                        latest_frame is None or latest_frame["artifact_id"] != plan_data.get("problem_frame_artifact_id") or
+                        latest_frame["status"] not in {ArtifactStatus.DRAFT.value, ArtifactStatus.READY.value}):
+                    raise ValueError("Research plan must reference the latest approved Problem Frame.")
+                frame_approval = self._latest_approval_event(c, project_id=project_id,
+                    artifact_id=latest_frame["artifact_id"])
+                frame_decision = (self._latest_approval_event(c, project_id=project_id,
+                    decision_id=latest_frame["decision_id"]) if latest_frame["decision_id"] else None)
+                if (not frame_approval or not frame_decision or
+                        frame_approval.status != ApprovalEventStatus.APPROVED or
+                        frame_decision.status != ApprovalEventStatus.APPROVED):
+                    raise ValueError("Research plan source Problem Frame is no longer approved.")
+                if row["status"] != "draft" and status == ApprovalEventStatus.APPROVED:
+                    raise ValueError("Only a draft research plan can be approved.")
+                plan_status = ("approved" if status == ApprovalEventStatus.APPROVED else
+                               "draft" if status == ApprovalEventStatus.CHANGES_REQUESTED else "rejected")
+                plan_data["status"] = plan_status
+                plan_data["approved_at"] = datetime.now(timezone.utc).isoformat() if plan_status == "approved" else None
+                c.execute("UPDATE research_plans SET plan_json=?,status=?,approved_at=? WHERE plan_id=?",
+                          (json.dumps(plan_data, ensure_ascii=False), plan_status,
+                           plan_data["approved_at"], plan_id))
+                self._p2_approval_checkpoint("after_plan_update", c)
+            else:
+                if stage != ProjectStageStatus.IN_PROGRESS and not (status != ApprovalEventStatus.APPROVED and stage == ProjectStageStatus.COMPLETED):
+                    raise ValueError(f"P2 must be in in_progress to review a report; it is {stage.value}.")
+                report_data = json.loads(artifact["content"] or "{}")
+                if status == ApprovalEventStatus.APPROVED and report_data.get("outcome", {}).get("execution_status") != "complete":
+                    raise ValueError("A partial research report can be reviewed, but cannot complete P2. Run the approved plan again to address execution failures.")
+                run_id = report_data.get("run_id")
+                run = c.execute("SELECT project_id FROM research_runs WHERE id=?", (run_id,)).fetchone()
+                if run is None or run["project_id"] != project_id:
+                    raise ValueError("Research report is not backed by a run owned by this project.")
+                workflow = c.execute("""SELECT workflow_run_id FROM workflow_runs
+                    WHERE project_id=? AND stage_key='P2' AND status='completed' AND output_artifact_id=?
+                    ORDER BY completed_at DESC LIMIT 1""", (project_id, artifact_id)).fetchone()
+                if status == ApprovalEventStatus.APPROVED and workflow is None:
+                    raise ValueError("P2 completion requires a successfully completed research workflow for this report.")
+
+            event = self._insert_approval_event(c, project_id=project_id, artifact_id=artifact_id,
+                                                status=status, actor=actor, comment=comment)
+            self._p2_approval_checkpoint("after_artifact_approval", c)
+            self._insert_approval_event(c, project_id=project_id, decision_id=decision_id,
+                                        status=status, actor=actor, comment=comment)
+            self._p2_approval_checkpoint("after_decision_approval", c)
+            if artifact_type == "research_report" and status == ApprovalEventStatus.APPROVED:
+                self._p2_approval_checkpoint("before_stage_completion", c)
+                self._transition_project_stage_in_transaction(c, project_id, ProjectStageKey.P2,
+                    ProjectStageStatus.COMPLETED, actor=actor, note="Research report approved by human.",
+                    expected_from={ProjectStageStatus.IN_PROGRESS})
+                self._p2_approval_checkpoint("after_stage_transition", c)
+            elif artifact_type == "research_report" and stage == ProjectStageStatus.COMPLETED:
+                self._transition_project_stage_in_transaction(c, project_id, ProjectStageKey.P2,
+                    ProjectStageStatus.IN_PROGRESS, actor=actor, note="Research report review requested changes.",
+                    expected_from={ProjectStageStatus.COMPLETED})
+            self._p2_approval_checkpoint("before_commit", c)
+            return event
+
+    def _p2_approval_checkpoint(self, point: str, connection) -> None:
+        """Test seam for P2 approval failure injection."""
+
+    def create_p2_research_plan(self, plan: ResearchPlan, *, title: str = "Research plan"):
+        """Persist plan, P2 start, linked decision, and versioned artifact atomically."""
+        if any(question.run_id != plan.run_id for question in plan.questions):
+            raise ValueError("Every research plan question must belong to the plan's research run.")
+        if plan.status != "draft":
+            raise ValueError("A new project research plan must begin as a draft.")
+        project_id = next((question.project_id for question in plan.questions if question.project_id), None)
+        if project_id is None:
+            raise ValueError("Project-scoped research questions must identify their project.")
+        if any(question.project_id != project_id for question in plan.questions):
+            raise ValueError("Every research plan question must belong to the same project.")
+        now = datetime.now(timezone.utc).isoformat()
+        decision_id, artifact_id = str(uuid4()), str(uuid4())
+        decision = DecisionCreate(project_id=project_id, stage_key=ProjectStageKey.P2,
+            title="Approve research plan")
+        content = plan.model_dump_json(indent=2)
+        if len(content.encode("utf-8")) > 512 * 1024:
+            raise ValueError("Artifact content is limited to 512 KiB; store larger output as a safe relative reference.")
+        with self.db() as c:
+            c.execute("BEGIN IMMEDIATE")
+            project = self._require_project(c, project_id, writable=True)
+            if project["status"] != ProjectStatus.ACTIVE.value:
+                raise ValueError("Research planning requires an active project.")
+            p1 = c.execute("SELECT status FROM project_stages WHERE project_id=? AND stage_key='P1'",
+                           (project_id,)).fetchone()
+            frame = c.execute("""SELECT * FROM project_artifacts WHERE project_id=? AND stage_key='P1'
+                AND artifact_type='problem_frame' ORDER BY version DESC,created_at DESC LIMIT 1""",
+                (project_id,)).fetchone()
+            if p1 is None or p1["status"] != ProjectStageStatus.COMPLETED.value or frame is None:
+                raise ValueError("P1 must be completed before creating a P2 plan.")
+            frame_approval = self._latest_approval_event(c, project_id=project_id, artifact_id=frame["artifact_id"])
+            decision_approval = (self._latest_approval_event(c, project_id=project_id, decision_id=frame["decision_id"])
+                                 if frame["decision_id"] else None)
+            if (frame["status"] not in {ArtifactStatus.DRAFT.value, ArtifactStatus.READY.value}
+                    or not frame_approval or not decision_approval
+                    or frame_approval.status != ApprovalEventStatus.APPROVED
+                    or decision_approval.status != ApprovalEventStatus.APPROVED):
+                raise ValueError("The latest Problem Frame and its linked decision must be approved.")
+            if plan.problem_frame_artifact_id != frame["artifact_id"] or plan.problem_frame_version != frame["version"]:
+                raise ValueError("Research plan must be based on the latest approved Problem Frame version.")
+            stage = c.execute("SELECT status FROM project_stages WHERE project_id=? AND stage_key='P2'",
+                              (project_id,)).fetchone()
+            if stage is None:
+                raise KeyError(f"Stage P2 is not initialized for project {project_id}.")
+            current = ProjectStageStatus(stage["status"])
+            if current == ProjectStageStatus.PENDING:
+                self._transition_project_stage_in_transaction(c, project_id, ProjectStageKey.P2,
+                    ProjectStageStatus.IN_PROGRESS, expected_from={ProjectStageStatus.PENDING})
+            elif current in {ProjectStageStatus.COMPLETED, ProjectStageStatus.SKIPPED}:
+                self._transition_project_stage_in_transaction(c, project_id, ProjectStageKey.P2,
+                    ProjectStageStatus.IN_PROGRESS, note="A revised research plan requires a new review.",
+                    expected_from={ProjectStageStatus.COMPLETED, ProjectStageStatus.SKIPPED})
+            elif current != ProjectStageStatus.IN_PROGRESS:
+                raise ValueError(f"A research plan cannot be created while P2 is {current.value}.")
+
+            c.execute("INSERT INTO research_runs(id,prompt,created_at,project_id) VALUES(?,?,?,?)",
+                      (plan.run_id, plan.brief.problem_statement, plan.created_at.isoformat(), project_id))
+            c.execute("INSERT INTO research_plans VALUES(?,?,?,?,?,?)",
+                      (plan.id, plan.run_id, plan.model_dump_json(), plan.status,
+                       plan.created_at.isoformat(), None))
+            for question in plan.questions:
+                self._insert_question(c, question)
+
+            previous = c.execute("""SELECT * FROM project_artifacts WHERE project_id=? AND stage_key='P2'
+                AND artifact_type='research_plan' ORDER BY version DESC,created_at DESC LIMIT 1""",
+                (project_id,)).fetchone()
+            artifact_key = previous["artifact_key"] if previous else str(uuid4())
+            version = previous["version"] + 1 if previous else 1
+            if previous is not None:
+                if previous["status"] not in {ArtifactStatus.DRAFT.value, ArtifactStatus.READY.value}:
+                    raise ValueError("A new research-plan version can only supersede a draft or ready plan.")
+                c.execute("UPDATE project_artifacts SET status='superseded',updated_at=? WHERE project_id=? AND artifact_id=?",
+                          (now, project_id, previous["artifact_id"]))
+            c.execute("""INSERT INTO decisions
+                (decision_id,project_id,stage_key,title,description,decision_type,status,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?)""",
+                (decision_id, project_id, ProjectStageKey.P2.value, decision.title,
+                 "Human review of the plan is required before research execution.", decision.decision_type,
+                 decision.status, now, now))
+            c.execute("""INSERT INTO project_artifacts
+                (artifact_id,artifact_key,project_id,stage_key,decision_id,artifact_type,title,description,content,storage_ref,version,status,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,NULL,?,'draft',?,?)""",
+                (artifact_id, artifact_key, project_id, ProjectStageKey.P2.value, decision_id,
+                 "research_plan", title, "Question-driven P2 research plan.", content, version, now, now))
+        artifact = self.get_artifact(project_id, artifact_id)
+        return plan, artifact, self.get_decision(project_id, decision_id)
+
+    def persist_p2_report(self, project_id: str, workflow_run_id: str, run_id: str,
+                          content: str, *, title: str = "Research report"):
+        """Persist the P2 report, linked decision, and workflow completion atomically."""
+        if len(content.encode("utf-8")) > 512 * 1024:
+            raise ValueError("Artifact content is limited to 512 KiB; store larger output as a safe relative reference.")
+        now = datetime.now(timezone.utc).isoformat()
+        decision_id, artifact_id = str(uuid4()), str(uuid4())
+        with self.db() as c:
+            c.execute("BEGIN IMMEDIATE")
+            self._require_project(c, project_id, writable=True)
+            workflow = c.execute("SELECT * FROM workflow_runs WHERE project_id=? AND workflow_run_id=?",
+                                 (project_id, workflow_run_id)).fetchone()
+            if workflow is None:
+                raise KeyError(f"Unknown workflow run: {workflow_run_id}")
+            if workflow["stage_key"] != ProjectStageKey.P2.value or workflow["status"] != WorkflowStatus.RUNNING.value:
+                raise ValueError("Only a running P2 research workflow can persist its report.")
+            run = c.execute("SELECT project_id FROM research_runs WHERE id=?", (run_id,)).fetchone()
+            if run is None or run["project_id"] != project_id:
+                raise ValueError("Research report run does not belong to this project.")
+            stage = c.execute("SELECT status FROM project_stages WHERE project_id=? AND stage_key='P2'",
+                              (project_id,)).fetchone()
+            if stage is None or stage["status"] != ProjectStageStatus.IN_PROGRESS.value:
+                raise ValueError("P2 must remain in progress while its report is persisted.")
+            previous = c.execute("""SELECT * FROM project_artifacts WHERE project_id=? AND stage_key='P2'
+                AND artifact_type='research_report' ORDER BY version DESC,created_at DESC LIMIT 1""",
+                (project_id,)).fetchone()
+            artifact_key = previous["artifact_key"] if previous else str(uuid4())
+            version = previous["version"] + 1 if previous else 1
+            if previous:
+                if previous["status"] not in {ArtifactStatus.DRAFT.value, ArtifactStatus.READY.value}:
+                    raise ValueError("A new research report can only supersede a draft or ready report.")
+                c.execute("UPDATE project_artifacts SET status='superseded',updated_at=? WHERE project_id=? AND artifact_id=?",
+                          (now, project_id, previous["artifact_id"]))
+            c.execute("""INSERT INTO decisions
+                (decision_id,project_id,stage_key,title,description,decision_type,status,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?)""",
+                (decision_id, project_id, ProjectStageKey.P2.value, "Approve research report",
+                 "Human review of source traceability, coverage, contradictions, and limitations.",
+                 "general", "open", now, now))
+            c.execute("""INSERT INTO project_artifacts
+                (artifact_id,artifact_key,project_id,stage_key,decision_id,artifact_type,title,description,content,storage_ref,version,status,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,NULL,?,'draft',?,?)""",
+                (artifact_id, artifact_key, project_id, ProjectStageKey.P2.value, decision_id,
+                 "research_report", title, "Source traceable P2 research output.", content, version, now, now))
+            c.execute("UPDATE workflow_runs SET status='completed',completed_at=?,output_artifact_id=? WHERE workflow_run_id=? AND status='running'",
+                      (now, artifact_id, workflow_run_id))
+            self._add_workflow_event(c, workflow_run_id, WorkflowStatus.RUNNING,
+                                     WorkflowStatus.COMPLETED, "Research report persisted.")
+        return self.get_artifact(project_id, artifact_id), self.get_decision(project_id, decision_id), \
+            self.get_workflow_run(project_id, workflow_run_id)
+
+    def start_project_stage(self, project_id, stage_key, *, actor="user"):
+        key = ProjectStageKey(stage_key)
+        if key != ProjectStageKey.P2:
+            return super().start_project_stage(project_id, key, actor=actor)
+        with self.db() as c:
+            c.execute("BEGIN IMMEDIATE")
+            project = self._require_project(c, project_id, writable=True)
+            if project["status"] != ProjectStatus.ACTIVE.value:
+                raise ValueError("P2 can only start for active projects.")
+            p1 = c.execute("SELECT status FROM project_stages WHERE project_id=? AND stage_key='P1'",
+                           (project_id,)).fetchone()
+            if p1 is None or p1["status"] != ProjectStageStatus.COMPLETED.value:
+                raise ValueError("P1 must be completed before P2 can start.")
+            frame = c.execute("""SELECT artifact_id,decision_id,status FROM project_artifacts
+                WHERE project_id=? AND stage_key='P1' AND artifact_type='problem_frame'
+                ORDER BY version DESC,created_at DESC LIMIT 1""", (project_id,)).fetchone()
+            if frame is None or frame["status"] not in {ArtifactStatus.DRAFT.value, ArtifactStatus.READY.value}:
+                raise ValueError("P2 requires an eligible latest approved Problem Frame.")
+            decision = frame["decision_id"]
+            artifact_approval = self._latest_approval_event(c, project_id=project_id, artifact_id=frame["artifact_id"])
+            decision_approval = self._latest_approval_event(c, project_id=project_id, decision_id=decision) if decision else None
+            if (not artifact_approval or not decision_approval or
+                    artifact_approval.status != ApprovalEventStatus.APPROVED or
+                    decision_approval.status != ApprovalEventStatus.APPROVED):
+                raise ValueError("P2 requires the latest Problem Frame and its linked decision to be approved.")
+            stage = self._transition_project_stage_in_transaction(c, project_id, key,
+                ProjectStageStatus.IN_PROGRESS, actor=actor, expected_from={ProjectStageStatus.PENDING})
+        return stage
+
+    def complete_project_stage(self, project_id, stage_key, *, actor="user", note=None):
+        """Gate P1 and P2 completion on their latest approved project artifacts."""
+        key = ProjectStageKey(stage_key)
+        if key not in {ProjectStageKey.P1, ProjectStageKey.P2}:
+            return super().complete_project_stage(project_id, key, actor=actor, note=note)
+        with self.db() as c:
+            c.execute("BEGIN IMMEDIATE")
+            project = self._require_project(c, project_id, writable=True)
+            if project["status"] != ProjectStatus.ACTIVE.value:
+                raise ValueError(f"{key.value} can only be completed for active projects.")
+            artifact_type = "problem_frame" if key == ProjectStageKey.P1 else "research_report"
+            latest = c.execute("""SELECT * FROM project_artifacts WHERE project_id=?
+                AND stage_key=? AND artifact_type=?
+                ORDER BY version DESC,created_at DESC,artifact_id DESC LIMIT 1""",
+                (project_id, key.value, artifact_type)).fetchone()
+            if latest is None:
+                raise ValueError(f"{key.value} cannot be completed without an approved {artifact_type.replace('_', ' ')}.")
+            if latest["status"] not in {ArtifactStatus.DRAFT.value, ArtifactStatus.READY.value}:
+                raise ValueError(f"{key.value} cannot be completed from an archived or superseded artifact.")
+            linked_decision = c.execute("SELECT stage_key FROM decisions WHERE project_id=? AND decision_id=?",
+                                        (project_id, latest["decision_id"])).fetchone() if latest["decision_id"] else None
+            if linked_decision is None or linked_decision["stage_key"] != key.value:
+                raise ValueError(f"{key.value} artifact does not have a linked {key.value} approval decision.")
+            if key == ProjectStageKey.P2:
+                report_data = json.loads(latest["content"] or "{}")
+                if report_data.get("outcome", {}).get("execution_status") != "complete":
+                    raise ValueError("A partial research report cannot complete P2.")
+                run = c.execute("SELECT project_id FROM research_runs WHERE id=?",
+                                (report_data.get("run_id"),)).fetchone()
+                if report_data.get("project_id") != project_id or run is None or run["project_id"] != project_id:
+                    raise ValueError("P2 report run does not belong to the project.")
+                workflow = c.execute("""SELECT 1 FROM workflow_runs
+                    WHERE project_id=? AND stage_key='P2' AND status='completed' AND output_artifact_id=? LIMIT 1""",
+                    (project_id, latest["artifact_id"])).fetchone()
+                if workflow is None:
+                    raise ValueError("P2 report is not the output of a successfully completed research workflow.")
+            artifact_event = self._latest_approval_event(c, project_id=project_id, artifact_id=latest["artifact_id"])
+            decision_event = (self._latest_approval_event(c, project_id=project_id, decision_id=latest["decision_id"])
+                              if latest["decision_id"] else None)
+            if not artifact_event or artifact_event.status != ApprovalEventStatus.APPROVED:
+                raise ValueError(f"{key.value} cannot be completed until the latest artifact is approved.")
+            if not decision_event or decision_event.status != ApprovalEventStatus.APPROVED:
+                raise ValueError(f"{key.value} cannot be completed until its linked decision is approved.")
+            if artifact_event.status != decision_event.status:
+                raise RuntimeError("P1 artifact and decision approval histories are inconsistent.")
+            stage = self._transition_project_stage_in_transaction(c, project_id, key, ProjectStageStatus.COMPLETED,
+                actor=actor, note=note, expected_from={ProjectStageStatus.IN_PROGRESS})
+        return stage
 
     @staticmethod
     def _require_project(c, project_id: str, *, writable: bool = False):
@@ -223,14 +682,8 @@ class ProjectStore(ResearchStore):
             c.execute("BEGIN IMMEDIATE")
             self._require_project(c, project_id, writable=True)
             self._require_decision(c, project_id, decision_id)
-            sequence = c.execute("SELECT COALESCE(MAX(event_sequence),0)+1 FROM approval_events").fetchone()[0]
-            event = ApprovalEvent(project_id=project_id, decision_id=decision_id, status=status,
-                                  actor=actor.strip(), comment=comment, event_sequence=sequence)
-            c.execute("""INSERT INTO approval_events
-                (approval_id,event_sequence,project_id,decision_id,status,actor,comment,created_at)
-                VALUES(?,?,?,?,?,?,?,?)""",
-                (event.approval_id, sequence, project_id, decision_id, status.value, event.actor,
-                 comment, event.created_at.isoformat()))
+            event = self._insert_approval_event(c, project_id=project_id, decision_id=decision_id,
+                                                status=status, actor=actor.strip(), comment=comment)
         return event
 
     def get_decision_approval_status(self, project_id: str, decision_id: str) -> str:
@@ -349,10 +802,8 @@ class ProjectStore(ResearchStore):
             self._require_project(c,project_id,writable=True)
             if not c.execute("SELECT 1 FROM project_artifacts WHERE project_id=? AND artifact_id=?",(project_id,artifact_id)).fetchone():
                 raise KeyError(f"Artifact {artifact_id} does not belong to project {project_id}.")
-            sequence = c.execute("SELECT COALESCE(MAX(event_sequence),0)+1 FROM approval_events").fetchone()[0]
-            event = ApprovalEvent(project_id=project_id,artifact_id=artifact_id,status=status,actor=actor.strip(),comment=comment,event_sequence=sequence)
-            c.execute("INSERT INTO approval_events(approval_id,event_sequence,project_id,artifact_id,status,actor,comment,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                (event.approval_id,sequence,project_id,artifact_id,status.value,event.actor,comment,event.created_at.isoformat()))
+            event = self._insert_approval_event(c, project_id=project_id, artifact_id=artifact_id,
+                                                status=status, actor=actor.strip(), comment=comment)
         return event
 
     def get_artifact_approval_status(self, project_id: str, artifact_id: str) -> str:

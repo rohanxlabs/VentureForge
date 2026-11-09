@@ -1,6 +1,7 @@
 from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor,as_completed,TimeoutError
 from dataclasses import dataclass,field
+import time
 from urllib.parse import parse_qsl,urlsplit,urlunsplit,urlencode
 from src.research.budget import BudgetExceeded,SearchBudget
 from src.research.connectors import ResearchConnectorError
@@ -24,6 +25,17 @@ class CollectionFailure:
     error:BaseException|None=field(default=None,repr=False,compare=False)
 
 @dataclass
+class SearchAttempt:
+    question_id:str
+    category:str
+    connector:str
+    query:str
+    status:str
+    source_count:int=0
+    elapsed_seconds:float=0.0
+    error:str=""
+
+@dataclass
 class CollectionResult:
     sources:list[SourceSnapshot]=field(default_factory=list)
     failures:list[CollectionFailure]=field(default_factory=list)
@@ -34,6 +46,7 @@ class CollectionResult:
     searches_attempted:int=0
     searches_succeeded:int=0
     searches_failed:int=0
+    attempts:list[SearchAttempt]=field(default_factory=list)
 
 def normalize_source_url(url:str)->str:
     parts=urlsplit(url)
@@ -55,7 +68,7 @@ class SearchOrchestrator:
         return []
 
     def collect(self,*,run_id:str,prompt:str,questions:list[ResearchQuestion],budget:SearchBudget)->CollectionResult:
-        failures=[]; jobs=[]
+        failures=[]; jobs=[]; attempts=[]
         ordered=sorted(enumerate(questions),key=lambda pair:(PRIORITY.get(pair[1].priority.value,9),pair[0]))
         for _,question in ordered:
             for category in dict.fromkeys(question.source_categories):
@@ -69,39 +82,54 @@ class SearchOrchestrator:
                         jobs.append((question,category,connector,query))
                     except BudgetExceeded as exc:
                         failures.append(CollectionFailure(question.id,category,connector.name,str(exc)))
+                        attempts.append(SearchAttempt(question.id,category,connector.name,query,
+                            "budget_exhausted",error=str(exc)))
 
         indexed={}; completed=set(); searches_succeeded=0; searches_failed=0
         with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
             futures={}
             for index,(question,category,connector,query) in enumerate(jobs):
                 limit=10 if connector.name=="hackernews" else 3
+                started=time.monotonic()
                 future=pool.submit(connector.search,run_id=run_id,question_id=question.id,query=query,category=category,max_results=limit)
-                futures[future]=(index,question,category,connector)
+                futures[future]=(index,question,category,connector,query,started)
             try:
                 for future in as_completed(futures,timeout=budget.remaining_seconds()):
-                    index,question,category,connector=futures[future]
+                    index,question,category,connector,query,started=futures[future]
                     completed.add(future)
                     try:
-                        indexed[index]=future.result()
+                        found=future.result()
+                        indexed[index]=found
                         searches_succeeded+=1
+                        attempts.append(SearchAttempt(question.id,category,connector.name,query,"succeeded",
+                            len(found),round(time.monotonic()-started,3)))
                     except ResearchConnectorError as exc:
                         searches_failed+=1
                         failures.append(CollectionFailure(question.id,category,connector.name,str(exc),exc))
+                        attempts.append(SearchAttempt(question.id,category,connector.name,query,"failed",
+                            elapsed_seconds=round(time.monotonic()-started,3),error=str(exc)))
             except TimeoutError:
-                for future,(index,question,category,connector) in futures.items():
+                for future,(index,question,category,connector,query,started) in futures.items():
                     if not future.done():
                         future.cancel()
                         searches_failed+=1
                         error=TimeoutError("Search exceeded the remaining time budget.")
                         failures.append(CollectionFailure(question.id,category,connector.name,str(error),error))
+                        attempts.append(SearchAttempt(question.id,category,connector.name,query,"timed_out",
+                            elapsed_seconds=round(time.monotonic()-started,3),error=str(error)))
                     elif future not in completed:
                         completed.add(future)
                         try:
-                            indexed[index]=future.result()
+                            found=future.result()
+                            indexed[index]=found
                             searches_succeeded+=1
+                            attempts.append(SearchAttempt(question.id,category,connector.name,query,"succeeded",
+                                len(found),round(time.monotonic()-started,3)))
                         except ResearchConnectorError as exc:
                             searches_failed+=1
                             failures.append(CollectionFailure(question.id,category,connector.name,str(exc),exc))
+                            attempts.append(SearchAttempt(question.id,category,connector.name,query,"failed",
+                                elapsed_seconds=round(time.monotonic()-started,3),error=str(exc)))
 
         raw_sources=[]
         for index in sorted(indexed): raw_sources.extend(indexed[index])
@@ -124,7 +152,8 @@ class SearchOrchestrator:
         return CollectionResult(sources=list(merged.values()),failures=failures,
             search_calls=stats["search_calls"],tavily_credits=stats["tavily_credits"],
             pages_fetched=stats["pages_fetched"],elapsed_seconds=stats["elapsed_seconds"],
-            searches_attempted=len(jobs),searches_succeeded=searches_succeeded,searches_failed=searches_failed)
+            searches_attempted=len(jobs),searches_succeeded=searches_succeeded,searches_failed=searches_failed,
+            attempts=sorted(attempts,key=lambda item:(item.question_id,item.connector,item.category,item.status)))
 
     def _fetch_missing(self,sources:list[SourceSnapshot],budget:SearchBudget):
         output=list(sources); failures=[]
