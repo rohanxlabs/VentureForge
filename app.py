@@ -27,6 +27,8 @@ from src.hackathon_validation_ui import build_problem_validation_ui
 from src.hackathon_solution_ui import build_solution_intelligence_ui
 from src.hackathon_engineering_ui import build_solution_engineering_ui
 from src.hackathon_execution_ui import build_mvp_execution_ui
+from src.hackathon_impact_ui import build_impact_feasibility_ui
+from src.hackathon_pitch_prep_ui import build_pitch_preparation_ui
 
 
 # =============================================================================
@@ -566,6 +568,8 @@ def create_ui() -> gr.Blocks:
         build_solution_intelligence_ui(gr, project_selector)
         build_solution_engineering_ui(gr, project_selector)
         build_mvp_execution_ui(gr, project_selector)
+        build_impact_feasibility_ui(gr, project_selector)
+        build_pitch_preparation_ui(gr, project_selector)
 
         gr.Markdown(
             """

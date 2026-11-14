@@ -1,4 +1,4 @@
-"""Sequential integration test of the Challenge Setup -> P6 project workflow.
+"""Sequential integration test of the Challenge Setup -> P8 project workflow.
 
 Research providers are deterministic synthetic fixtures; this exercises project
 ownership, artifacts, approvals, version references, and all stage transitions.
@@ -24,6 +24,10 @@ from src.hackathon_intake import (
     approve_challenge_brief,
     save_challenge_brief,
 )
+from src.hackathon_impact import impact_context, review_impact_brief, save_impact_brief
+from src.hackathon_impact_ui import _starter as p7_starter
+from src.hackathon_pitch_prep import pitch_prep_context, review_pitch_prep, save_pitch_prep
+from src.hackathon_pitch_prep_ui import _starter as p8_starter
 from src.hackathon_solution import (
     SolutionDirectionAction,
     SolutionOptionsDraft,
@@ -72,7 +76,7 @@ def flood_warning_extractor(question, source):
 
 
 class HackathonWorkflowEndToEndTests(unittest.TestCase):
-    def test_flood_warning_problem_completes_sequentially_through_p6(self):
+    def test_flood_warning_problem_completes_sequentially_through_p8(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = ProjectStore(Path(temp_dir) / "workflow-e2e.sqlite")
             project = store.create_project(ProjectCreate(name="Flood warning hackathon test"))
@@ -177,13 +181,39 @@ class HackathonWorkflowEndToEndTests(unittest.TestCase):
             review_execution_record(store, project_id, p6_artifact.artifact_id, p6_decision.decision_id,
                 ApprovalEventStatus.APPROVED)
 
+            p7_context = impact_context(store, project_id)
+            _impact_brief, p7_artifact, p7_decision = save_impact_brief(store, project_id,
+                p7_starter(p7_context))
+            review_impact_brief(store, project_id, p7_artifact.artifact_id, p7_decision.decision_id,
+                ApprovalEventStatus.APPROVED)
+
+            p8_context = pitch_prep_context(store, project_id)
+            _pitch_package, p8_artifact, p8_decision = save_pitch_prep(store, project_id,
+                p8_starter(p8_context))
+            review_pitch_prep(store, project_id, p8_artifact.artifact_id, p8_decision.decision_id,
+                ApprovalEventStatus.APPROVED)
+
             self.assertEqual([store.get_project_stage(project_id, stage).status.value
                 for stage in (ProjectStageKey.P1, ProjectStageKey.P2, ProjectStageKey.P3,
-                              ProjectStageKey.P4, ProjectStageKey.P5, ProjectStageKey.P6)],
-                ["completed"] * 6)
+                              ProjectStageKey.P4, ProjectStageKey.P5, ProjectStageKey.P6,
+                              ProjectStageKey.P7, ProjectStageKey.P8)], ["completed"] * 8)
             saved_p6 = json.loads(p6_artifact.content)
             self.assertEqual(saved_p6["p5_artifact_id"], p5_artifact.artifact_id)
             self.assertEqual(p4_artifact.stage_key, ProjectStageKey.P4)
+            self.assertEqual(json.loads(p7_artifact.content)["p6_artifact_id"], p6_artifact.artifact_id)
+            self.assertEqual(json.loads(p8_artifact.content)["p7_artifact_id"], p7_artifact.artifact_id)
+            for artifact in (brief, frame, report, p5_artifact, p6_artifact, p7_artifact, p8_artifact):
+                self.assertEqual(store.get_artifact_approval_status(project_id, artifact.artifact_id),
+                                 ApprovalEventStatus.APPROVED.value)
+            self.assertEqual(json.loads(p8_artifact.content)["p1_artifact_id"], frame.artifact_id)
+            self.assertEqual(json.loads(p8_artifact.content)["p6_artifact_id"], p6_artifact.artifact_id)
+
+            reopened = ProjectStore(Path(temp_dir) / "workflow-e2e.sqlite")
+            self.assertEqual([stage.status.value for stage in reopened.list_project_stages(project_id)],
+                             ["completed"] * 8)
+            persisted_p8 = next(item for item in reopened.list_project_artifacts(project_id)
+                                if item.artifact_id == p8_artifact.artifact_id)
+            self.assertEqual(json.loads(persisted_p8.content), json.loads(p8_artifact.content))
 
 
 if __name__ == "__main__":

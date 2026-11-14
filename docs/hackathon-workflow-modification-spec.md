@@ -1,6 +1,6 @@
 # Hackathon Research Workflow: Project-Specific Modification Spec
 
-**Status:** Implementation in progress - Challenge Setup and P1-P6 slices  
+**Status:** Implemented through P8 — Challenge Setup and P1-P8 stage workflows
 **Purpose:** Adapt VentureForge into a project-centered workflow that helps a team investigate a hackathon challenge, make evidence-backed decisions, build a focused MVP, and prepare a rubric-aligned submission.
 
 ## Product goal
@@ -118,6 +118,8 @@ For each criterion, show the project claim, supporting artifact or demo moment, 
 
 **Output:** Rubric-mapped submission checklist and pitch/demo package. Existing pitch generation can draft material, but project evidence and final claims require human review.
 
+**Implemented in the current slice:** P8 is gated on approved P1-P7 work and reuses the existing pitch model structures. It prepares a rubric-by-rubric proof map, judge questions, timed slide outline, demo script with real/mocked/simulated/deferred labels, submission deliverables from the challenge brief, remaining gaps, claims/nonclaims, and exact upstream artifact versions. Unknown evidence references and missing or extra rubric criteria are rejected. The package is versioned and requires human review; changes requested reopen P8, and direct completion is blocked without approval.
+
 ## Cross-stage behavior
 
 - Keep versioned artifacts and append-only approval/decision history using existing project storage.
@@ -175,6 +177,8 @@ Connect P1–P2 to the project UI, add first-hand research records, and redesign
 **Implemented in the current slice:** P5 opens only after P4 has a selected direction. The engineering plan captures a user journey, architecture and data flow, integrations, security/privacy/accessibility considerations, failure behavior, scope boundary, task dependencies, owners, person-hour estimates, event-rubric mapping, and demo/test acceptance criteria. Tasks and integrations label what is real, mocked, simulated, or deferred. Capacity is compared with the event team/time inputs as a planning warning. Plans reference the exact P1-P4 versions, are versioned, and require human approval; requested changes reopen P5, and direct stage completion is blocked without an approved latest plan.
 
 **Implemented in the current slice:** P6 seeds a versioned execution board from the approved P5 task list, test scenarios, and demo acceptance criteria. The team records task status, blockers, completion evidence or deferral reasons, test environment and observed results, failure notes, demo links, and limitations. Dependency order is checked, every planned test/check must have a result before completion, and task/test records must match the current approved P5 version. Failed tests may remain visible when their failure and limitation are documented and the human reviewer accepts the execution record. P6 approval is an explicit review gate; requesting changes reopens the stage, and direct completion is blocked without the latest reviewed execution record.
+
+**Implemented in the current slice:** P7 is gated on the latest approved P1-P6 work and records an impact hypothesis, beneficiary group, mechanism, primary metric and measurement method, stakeholder interests and adoption barriers, adoption steps, resource assumptions, operational considerations, risks and mitigations, rubric alignment, and limitations/nonclaims. Verified P2 evidence and completed P6 test IDs are shown for traceable references. Prototype signals must cite completed P6 tests and remain distinct from real-world impact measurements. The brief references exact upstream artifact versions, is versioned, and requires human review before P7 completion; requesting changes reopens P7.
 
 ### Phase C — Solution choice and testable MVP
 

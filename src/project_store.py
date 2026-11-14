@@ -489,6 +489,228 @@ class ProjectStore(ResearchStore):
                for test in execution.get("tests", [])):
             raise ValueError("Every failed test needs a known failure or limitation recorded.")
 
+    def approve_p7_impact(self, project_id: str, artifact_id: str, decision_id: str,
+                          status: ApprovalEventStatus, *, actor: str = "user",
+                          comment: str = "") -> ApprovalEvent:
+        """Atomically review the latest P7 impact brief and transition its stage."""
+        status = ApprovalEventStatus(status)
+        if status not in {ApprovalEventStatus.APPROVED, ApprovalEventStatus.CHANGES_REQUESTED,
+                          ApprovalEventStatus.REJECTED}:
+            raise ValueError("P7 review must be approved, changes_requested, or rejected.")
+        if not actor.strip():
+            raise ValueError("Approval actor cannot be empty.")
+        actor = actor.strip()
+        with self.db() as c:
+            c.execute("BEGIN IMMEDIATE")
+            project = self._require_project(c, project_id, writable=True)
+            if project["status"] != ProjectStatus.ACTIVE.value:
+                raise ValueError("P7 briefs can only be reviewed for active projects.")
+            artifact = c.execute("SELECT * FROM project_artifacts WHERE project_id=? AND artifact_id=?",
+                                 (project_id, artifact_id)).fetchone()
+            if artifact is None:
+                raise KeyError(f"Artifact {artifact_id} does not belong to project {project_id}.")
+            if artifact["stage_key"] != ProjectStageKey.P7.value or artifact["artifact_type"] != "impact_feasibility_brief":
+                raise ValueError("Artifact is not a P7 impact and feasibility brief.")
+            latest = c.execute("""SELECT artifact_id FROM project_artifacts
+                WHERE project_id=? AND stage_key='P7' AND artifact_type='impact_feasibility_brief'
+                ORDER BY version DESC,created_at DESC,artifact_id DESC LIMIT 1""", (project_id,)).fetchone()
+            if latest is None or latest["artifact_id"] != artifact_id:
+                raise ValueError("Only the latest P7 impact brief can be reviewed.")
+            if artifact["status"] not in {ArtifactStatus.DRAFT.value, ArtifactStatus.READY.value}:
+                raise ValueError("Only a draft or ready P7 brief can be reviewed.")
+            decision = c.execute("SELECT stage_key FROM decisions WHERE project_id=? AND decision_id=?",
+                                  (project_id, decision_id)).fetchone()
+            if decision is None:
+                raise KeyError(f"Decision {decision_id} does not belong to project {project_id}.")
+            if decision["stage_key"] != ProjectStageKey.P7.value or artifact["decision_id"] != decision_id:
+                raise ValueError("Review decision is not linked to this P7 impact brief.")
+            stage_row = c.execute("SELECT status FROM project_stages WHERE project_id=? AND stage_key='P7'",
+                                  (project_id,)).fetchone()
+            if stage_row is None:
+                raise KeyError(f"Stage P7 is not initialized for project {project_id}.")
+            stage = ProjectStageStatus(stage_row["status"])
+            artifact_prior = self._latest_approval_event(c, project_id=project_id, artifact_id=artifact_id)
+            decision_prior = self._latest_approval_event(c, project_id=project_id, decision_id=decision_id)
+            if artifact_prior and decision_prior and artifact_prior.status == decision_prior.status == status:
+                if status == ApprovalEventStatus.APPROVED and stage == ProjectStageStatus.COMPLETED:
+                    return artifact_prior
+                if status != ApprovalEventStatus.APPROVED and stage == ProjectStageStatus.IN_PROGRESS:
+                    return artifact_prior
+            if ((artifact_prior is None) != (decision_prior is None) or
+                    (artifact_prior and decision_prior and artifact_prior.status != decision_prior.status)):
+                raise RuntimeError("P7 artifact and decision review histories are inconsistent.")
+            if status == ApprovalEventStatus.APPROVED and stage != ProjectStageStatus.IN_PROGRESS:
+                raise ValueError(f"P7 must be in progress before approval; it is {stage.value}.")
+            if status != ApprovalEventStatus.APPROVED and stage not in {
+                    ProjectStageStatus.IN_PROGRESS, ProjectStageStatus.COMPLETED}:
+                raise ValueError(f"P7 review requires in_progress or completed status; it is {stage.value}.")
+            if status == ApprovalEventStatus.APPROVED:
+                self._validate_p7_completion_in_transaction(c, project_id, artifact)
+            self._insert_approval_event(c, project_id=project_id, artifact_id=artifact_id,
+                status=status, actor=actor, comment=comment)
+            event = self._insert_approval_event(c, project_id=project_id, decision_id=decision_id,
+                status=status, actor=actor, comment=comment)
+            if status == ApprovalEventStatus.APPROVED:
+                self._transition_project_stage_in_transaction(c, project_id, ProjectStageKey.P7,
+                    ProjectStageStatus.COMPLETED, actor=actor,
+                    note="Impact and feasibility brief approved by human.",
+                    expected_from={ProjectStageStatus.IN_PROGRESS})
+            elif stage == ProjectStageStatus.COMPLETED:
+                self._transition_project_stage_in_transaction(c, project_id, ProjectStageKey.P7,
+                    ProjectStageStatus.IN_PROGRESS, actor=actor,
+                    note=f"Impact and feasibility review {status.value}.",
+                    expected_from={ProjectStageStatus.COMPLETED})
+        return event
+
+    @staticmethod
+    def _validate_p7_completion_in_transaction(c, project_id: str, artifact) -> None:
+        p6_stage = c.execute("SELECT status FROM project_stages WHERE project_id=? AND stage_key='P6'",
+                              (project_id,)).fetchone()
+        p6 = c.execute("""SELECT * FROM project_artifacts WHERE project_id=? AND stage_key='P6'
+            AND artifact_type='mvp_execution' ORDER BY version DESC,created_at DESC,artifact_id DESC LIMIT 1""",
+            (project_id,)).fetchone()
+        if p6 is None or p6_stage is None or p6_stage["status"] != ProjectStageStatus.COMPLETED.value:
+            raise ValueError("P7 requires a completed P6 execution and test record.")
+        p6_artifact_event = ProjectStore._latest_approval_event(c, project_id=project_id, artifact_id=p6["artifact_id"])
+        p6_decision_event = (ProjectStore._latest_approval_event(c, project_id=project_id, decision_id=p6["decision_id"])
+                             if p6["decision_id"] else None)
+        if (not p6_artifact_event or not p6_decision_event
+                or p6_artifact_event.status != ApprovalEventStatus.APPROVED
+                or p6_decision_event.status != ApprovalEventStatus.APPROVED):
+            raise ValueError("P7 requires the latest P6 record and its linked decision to be approved.")
+        brief = json.loads(artifact["content"] or "{}")
+        if brief.get("p6_artifact_id") != p6["artifact_id"] or brief.get("p6_artifact_version") != p6["version"]:
+            raise ValueError("P7 impact brief does not match the latest P6 execution record.")
+        upstream_types = {
+            "p1": ("P1", "problem_frame"), "p2": ("P2", "research_report"),
+            "p3": ("P3", "validation_decision"), "p4": ("P4", "solution_options"),
+            "p5": ("P5", "engineering_plan"),
+        }
+        for prefix, (stage_key, artifact_type) in upstream_types.items():
+            upstream = c.execute("""SELECT artifact_id,version FROM project_artifacts WHERE project_id=?
+                AND stage_key=? AND artifact_type=? ORDER BY version DESC,created_at DESC,artifact_id DESC LIMIT 1""",
+                (project_id, stage_key, artifact_type)).fetchone()
+            if (upstream is None or brief.get(f"{prefix}_artifact_id") != upstream["artifact_id"]
+                    or brief.get(f"{prefix}_artifact_version") != upstream["version"]):
+                raise ValueError("P7 impact brief references stale upstream project work.")
+        p4 = c.execute("""SELECT content FROM project_artifacts WHERE project_id=? AND stage_key='P4'
+            AND artifact_type='solution_options' ORDER BY version DESC,created_at DESC,artifact_id DESC LIMIT 1""",
+            (project_id,)).fetchone()
+        p4_data = json.loads(p4["content"] or "{}") if p4 else {}
+        if brief.get("selected_option_id") != p4_data.get("selected_option_id"):
+            raise ValueError("P7 impact brief does not match the selected P4 direction.")
+
+    def approve_p8_pitch(self, project_id: str, artifact_id: str, decision_id: str,
+                         status: ApprovalEventStatus, *, actor: str = "user",
+                         comment: str = "") -> ApprovalEvent:
+        """Atomically review the latest P8 package and transition its stage."""
+        status = ApprovalEventStatus(status)
+        if status not in {ApprovalEventStatus.APPROVED, ApprovalEventStatus.CHANGES_REQUESTED,
+                          ApprovalEventStatus.REJECTED}:
+            raise ValueError("P8 review must be approved, changes_requested, or rejected.")
+        if not actor.strip():
+            raise ValueError("Approval actor cannot be empty.")
+        actor = actor.strip()
+        with self.db() as c:
+            c.execute("BEGIN IMMEDIATE")
+            project = self._require_project(c, project_id, writable=True)
+            if project["status"] != ProjectStatus.ACTIVE.value:
+                raise ValueError("P8 packages can only be reviewed for active projects.")
+            artifact = c.execute("SELECT * FROM project_artifacts WHERE project_id=? AND artifact_id=?",
+                                 (project_id, artifact_id)).fetchone()
+            if artifact is None:
+                raise KeyError(f"Artifact {artifact_id} does not belong to project {project_id}.")
+            if artifact["stage_key"] != ProjectStageKey.P8.value or artifact["artifact_type"] != "pitch_preparation_package":
+                raise ValueError("Artifact is not a P8 pitch preparation package.")
+            latest = c.execute("""SELECT artifact_id FROM project_artifacts
+                WHERE project_id=? AND stage_key='P8' AND artifact_type='pitch_preparation_package'
+                ORDER BY version DESC,created_at DESC,artifact_id DESC LIMIT 1""", (project_id,)).fetchone()
+            if latest is None or latest["artifact_id"] != artifact_id:
+                raise ValueError("Only the latest P8 pitch package can be reviewed.")
+            if artifact["status"] not in {ArtifactStatus.DRAFT.value, ArtifactStatus.READY.value}:
+                raise ValueError("Only a draft or ready P8 package can be reviewed.")
+            decision = c.execute("SELECT stage_key FROM decisions WHERE project_id=? AND decision_id=?",
+                                  (project_id, decision_id)).fetchone()
+            if decision is None:
+                raise KeyError(f"Decision {decision_id} does not belong to project {project_id}.")
+            if decision["stage_key"] != ProjectStageKey.P8.value or artifact["decision_id"] != decision_id:
+                raise ValueError("Review decision is not linked to this P8 package.")
+            stage_row = c.execute("SELECT status FROM project_stages WHERE project_id=? AND stage_key='P8'",
+                                  (project_id,)).fetchone()
+            if stage_row is None:
+                raise KeyError(f"Stage P8 is not initialized for project {project_id}.")
+            stage = ProjectStageStatus(stage_row["status"])
+            artifact_prior = self._latest_approval_event(c, project_id=project_id, artifact_id=artifact_id)
+            decision_prior = self._latest_approval_event(c, project_id=project_id, decision_id=decision_id)
+            if artifact_prior and decision_prior and artifact_prior.status == decision_prior.status == status:
+                if status == ApprovalEventStatus.APPROVED and stage == ProjectStageStatus.COMPLETED:
+                    return artifact_prior
+                if status != ApprovalEventStatus.APPROVED and stage == ProjectStageStatus.IN_PROGRESS:
+                    return artifact_prior
+            if ((artifact_prior is None) != (decision_prior is None) or
+                    (artifact_prior and decision_prior and artifact_prior.status != decision_prior.status)):
+                raise RuntimeError("P8 artifact and decision review histories are inconsistent.")
+            if status == ApprovalEventStatus.APPROVED and stage != ProjectStageStatus.IN_PROGRESS:
+                raise ValueError(f"P8 must be in progress before approval; it is {stage.value}.")
+            if status != ApprovalEventStatus.APPROVED and stage not in {
+                    ProjectStageStatus.IN_PROGRESS, ProjectStageStatus.COMPLETED}:
+                raise ValueError(f"P8 review requires in_progress or completed status; it is {stage.value}.")
+            if status == ApprovalEventStatus.APPROVED:
+                self._validate_p8_completion_in_transaction(c, project_id, artifact)
+            self._insert_approval_event(c, project_id=project_id, artifact_id=artifact_id,
+                status=status, actor=actor, comment=comment)
+            event = self._insert_approval_event(c, project_id=project_id, decision_id=decision_id,
+                status=status, actor=actor, comment=comment)
+            if status == ApprovalEventStatus.APPROVED:
+                self._transition_project_stage_in_transaction(c, project_id, ProjectStageKey.P8,
+                    ProjectStageStatus.COMPLETED, actor=actor,
+                    note="Pitch and judge preparation package approved by human.",
+                    expected_from={ProjectStageStatus.IN_PROGRESS})
+            elif stage == ProjectStageStatus.COMPLETED:
+                self._transition_project_stage_in_transaction(c, project_id, ProjectStageKey.P8,
+                    ProjectStageStatus.IN_PROGRESS, actor=actor,
+                    note=f"Pitch package review {status.value}.",
+                    expected_from={ProjectStageStatus.COMPLETED})
+        return event
+
+    @staticmethod
+    def _validate_p8_completion_in_transaction(c, project_id: str, artifact) -> None:
+        p7_stage = c.execute("SELECT status FROM project_stages WHERE project_id=? AND stage_key='P7'",
+                              (project_id,)).fetchone()
+        p7 = c.execute("""SELECT * FROM project_artifacts WHERE project_id=? AND stage_key='P7'
+            AND artifact_type='impact_feasibility_brief' ORDER BY version DESC,created_at DESC,artifact_id DESC LIMIT 1""",
+            (project_id,)).fetchone()
+        if p7 is None or p7_stage is None or p7_stage["status"] != ProjectStageStatus.COMPLETED.value:
+            raise ValueError("P8 requires completed and approved P7 impact work.")
+        p7_artifact_event = ProjectStore._latest_approval_event(c, project_id=project_id, artifact_id=p7["artifact_id"])
+        p7_decision_event = (ProjectStore._latest_approval_event(c, project_id=project_id, decision_id=p7["decision_id"])
+                             if p7["decision_id"] else None)
+        if (not p7_artifact_event or not p7_decision_event
+                or p7_artifact_event.status != ApprovalEventStatus.APPROVED
+                or p7_decision_event.status != ApprovalEventStatus.APPROVED):
+            raise ValueError("P8 requires the latest P7 brief and its linked decision to be approved.")
+        package = json.loads(artifact["content"] or "{}")
+        if package.get("p7_artifact_id") != p7["artifact_id"] or package.get("p7_artifact_version") != p7["version"]:
+            raise ValueError("P8 package does not match the latest P7 brief.")
+        upstream_types = {
+            "p1": ("P1", "problem_frame"), "p2": ("P2", "research_report"),
+            "p3": ("P3", "validation_decision"), "p4": ("P4", "solution_options"),
+            "p5": ("P5", "engineering_plan"), "p6": ("P6", "mvp_execution"),
+        }
+        for prefix, (stage_key, artifact_type) in upstream_types.items():
+            upstream = c.execute("""SELECT artifact_id,version FROM project_artifacts WHERE project_id=?
+                AND stage_key=? AND artifact_type=? ORDER BY version DESC,created_at DESC,artifact_id DESC LIMIT 1""",
+                (project_id, stage_key, artifact_type)).fetchone()
+            if (upstream is None or package.get(f"{prefix}_artifact_id") != upstream["artifact_id"]
+                    or package.get(f"{prefix}_artifact_version") != upstream["version"]):
+                raise ValueError("P8 package references stale upstream project work.")
+        p4 = c.execute("""SELECT content FROM project_artifacts WHERE project_id=? AND stage_key='P4'
+            AND artifact_type='solution_options' ORDER BY version DESC,created_at DESC,artifact_id DESC LIMIT 1""",
+            (project_id,)).fetchone()
+        p4_data = json.loads(p4["content"] or "{}") if p4 else {}
+        if package.get("selected_option_id") != p4_data.get("selected_option_id"):
+            raise ValueError("P8 package does not match the selected P4 direction.")
+
     def create_p2_research_plan(self, plan: ResearchPlan, *, title: str = "Research plan"):
         """Persist plan, P2 start, linked decision, and versioned artifact atomically."""
         if any(question.run_id != plan.run_id for question in plan.questions):
@@ -678,7 +900,8 @@ class ProjectStore(ResearchStore):
     def complete_project_stage(self, project_id, stage_key, *, actor="user", note=None):
         """Gate implemented stages on their latest approved project artifacts."""
         key = ProjectStageKey(stage_key)
-        if key not in {ProjectStageKey.P1, ProjectStageKey.P2, ProjectStageKey.P5, ProjectStageKey.P6}:
+        if key not in {ProjectStageKey.P1, ProjectStageKey.P2, ProjectStageKey.P5,
+                       ProjectStageKey.P6, ProjectStageKey.P7, ProjectStageKey.P8}:
             return super().complete_project_stage(project_id, key, actor=actor, note=note)
         with self.db() as c:
             c.execute("BEGIN IMMEDIATE")
@@ -690,6 +913,8 @@ class ProjectStore(ResearchStore):
                 ProjectStageKey.P2: "research_report",
                 ProjectStageKey.P5: "engineering_plan",
                 ProjectStageKey.P6: "mvp_execution",
+                ProjectStageKey.P7: "impact_feasibility_brief",
+                ProjectStageKey.P8: "pitch_preparation_package",
             }[key]
             latest = c.execute("""SELECT * FROM project_artifacts WHERE project_id=?
                 AND stage_key=? AND artifact_type=?
@@ -732,6 +957,10 @@ class ProjectStore(ResearchStore):
                     raise ValueError("P5 engineering plan does not match the latest selected P4 direction.")
             if key == ProjectStageKey.P6:
                 self._validate_p6_completion_in_transaction(c, project_id, latest)
+            if key == ProjectStageKey.P7:
+                self._validate_p7_completion_in_transaction(c, project_id, latest)
+            if key == ProjectStageKey.P8:
+                self._validate_p8_completion_in_transaction(c, project_id, latest)
             artifact_event = self._latest_approval_event(c, project_id=project_id, artifact_id=latest["artifact_id"])
             decision_event = (self._latest_approval_event(c, project_id=project_id, decision_id=latest["decision_id"])
                               if latest["decision_id"] else None)
