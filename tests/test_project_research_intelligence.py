@@ -325,6 +325,25 @@ class ProjectResearchIntelligenceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "latest approved Problem Frame"):
             self.approve_plan(artifact, decision)
 
+    def test_stale_approved_plan_is_rejected_before_research_run_is_created(self):
+        _plan, artifact, decision = self.make_plan()
+        self.approve_plan(artifact, decision)
+        revised = create_frame(ProblemInput(title="Revised hazard warning timing",
+            description="Residents receive warning information after safe travel routes close.",
+            primary_users=["Residents near flood-prone routes"]))
+        new_frame, new_decision = save_frame(self.store, self.project.project_id, revised)
+        approve_frame(self.store, self.project.project_id, new_frame.artifact_id,
+                      new_decision.decision_id, ApprovalEventStatus.APPROVED)
+        workflows_before = len(self.store.list_project_workflows(self.project.project_id))
+        with self.store.db() as c:
+            evidence_before = c.execute("SELECT COUNT(*) FROM evidence").fetchone()[0]
+        with self.assertRaisesRegex(ValueError, "stale P1 frame"):
+            execute_project_research(self.store, self.project.project_id,
+                orchestrator=SyntheticOrchestrator(), max_rounds=1, extractor=synthetic_extractor)
+        self.assertEqual(len(self.store.list_project_workflows(self.project.project_id)), workflows_before)
+        with self.store.db() as c:
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM evidence").fetchone()[0], evidence_before)
+
     def test_cross_project_plan_and_missing_plan_rejected(self):
         with self.assertRaisesRegex(ValueError, "No P2 research plan"):
             latest_approved_plan(self.store, self.project.project_id)

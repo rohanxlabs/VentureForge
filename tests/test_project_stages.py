@@ -97,19 +97,25 @@ class ProjectStageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Invalid stage transition"):
             self.store.transition_project_stage(self.project.project_id, "P1", "skipped", reason="too late")
 
+    def test_base_store_fails_closed_for_p3_p4_generic_completion(self):
+        self.store.start_project_stage(self.project.project_id, "P3")
+        with self.assertRaisesRegex(ValueError, "requires ProjectStore workflow validation"):
+            self.store.complete_project_stage(self.project.project_id, "P3")
+        with self.assertRaisesRegex(ValueError, "cannot be skipped"):
+            self.store.skip_project_stage(self.project.project_id, "P4", "Waived")
+
     def test_current_stage_derivation_and_project_completion(self):
         self.store.start_project_stage(self.project.project_id, "P1")
         self.store.complete_project_stage(self.project.project_id, "P1")
         self.assertEqual(self.store.get_project(self.project.project_id).current_stage, "P2")
-        for index in range(2, 9):
+        for index in (2, 5, 6, 7, 8):
             self.store.skip_project_stage(self.project.project_id, f"P{index}", f"Stage {index} waived")
+        for index in (3, 4):
+            with self.assertRaisesRegex(ValueError, "cannot be skipped"):
+                self.store.skip_project_stage(self.project.project_id, f"P{index}", f"Stage {index} waived")
+            self.store.start_project_stage(self.project.project_id, f"P{index}")
         project = self.store.get_project(self.project.project_id)
-        self.assertIsNone(project.current_stage)
-        self.assertEqual(project.status, ProjectStatus.COMPLETED)
-        reopened = self.store.reopen_project_stage(self.project.project_id, "P4")
-        self.assertEqual(reopened.status, ProjectStageStatus.IN_PROGRESS)
-        project = self.store.get_project(self.project.project_id)
-        self.assertEqual(project.current_stage, "P4")
+        self.assertEqual(project.current_stage, "P3")
         self.assertEqual(project.status, ProjectStatus.ACTIVE)
 
     def test_cli_stage_commands_work_and_report_invalid_transitions(self):
@@ -119,22 +125,20 @@ class ProjectStageTests(unittest.TestCase):
 
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            # P1/P2 have stage-specific artifact gates; cover generic transitions
-            # on P3 and cover P1/P2 gates in their own service tests.
+            # P3 generic completion is guarded even through the CLI.
             self.assertIsNone(research_cli.main(["project", "stage", "start", self.project.project_id, "P3",
                                                  "--database", str(self.database)]))
-            self.assertIsNone(research_cli.main(["project", "stage", "complete", self.project.project_id, "P3",
-                                                 "--database", str(self.database)]))
+            self.assertEqual(research_cli.main(["project", "stage", "complete", self.project.project_id, "P3",
+                                                 "--database", str(self.database)]), 2)
             self.assertIsNone(research_cli.main(["project", "stage", "history", self.project.project_id, "P3",
                                                  "--database", str(self.database)]))
-        self.assertIn("P3 complete: completed", output.getvalue())
-        self.assertIn("in_progress -> completed", output.getvalue())
+        self.assertNotIn("P3 complete: completed", output.getvalue())
         errors = io.StringIO()
         with contextlib.redirect_stderr(errors):
             result = research_cli.main(["project", "stage", "complete", self.project.project_id, "P3",
                                         "--database", str(self.database)])
         self.assertEqual(result, 2)
-        self.assertIn("must be in in_progress", errors.getvalue())
+        self.assertIn("P3 requires completed P1 and P2", errors.getvalue())
 
     def test_transition_rolls_back_status_history_and_project_pointer_together(self):
         with self.store.db() as connection:

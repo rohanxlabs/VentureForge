@@ -28,11 +28,17 @@ def latest_approved_plan(store: ProjectStore, project_id: str):
     artifact = _latest_artifact(store, project_id, "research_plan")
     if artifact is None:
         raise ValueError("No P2 research plan exists for this project.")
+    plan_data = json.loads(artifact.content or "{}")
+    frame_artifact = latest_problem_frame(store, project_id)
+    if (frame_artifact is None
+            or plan_data.get("problem_frame_artifact_id") != frame_artifact.artifact_id
+            or plan_data.get("problem_frame_version") != frame_artifact.version):
+        raise ValueError("The approved research plan references a stale P1 frame; revise the plan before collecting evidence.")
     if not artifact.decision_id or store.get_artifact_approval_status(project_id, artifact.artifact_id) != "approved":
         raise ValueError("The latest research plan must be approved before research can run.")
     if store.get_decision_approval_status(project_id, artifact.decision_id) != "approved":
         raise ValueError("The linked research-plan decision is not approved.")
-    plan = store.get_plan(json.loads(artifact.content or "{}").get("id", ""))
+    plan = store.get_plan(plan_data.get("id", ""))
     if plan.status != "approved":
         raise ValueError("The persisted research plan is not approved.")
     store.validate_run_project(plan.run_id, project_id)
@@ -89,6 +95,7 @@ def execute_project_research(store: ProjectStore, project_id: str, *,
         report_data = {
             "schema": "ventureforge.p2.report.v1", "project_id": project_id,
             "plan_id": plan.id, "plan_artifact_id": plan_artifact.artifact_id,
+            "plan_artifact_version": plan_artifact.version,
             "run_id": plan.run_id, "generated_by": "existing_research_pipeline",
             "problem_context": json.loads(frame_artifact.content or "{}"),
             "research_objectives": plan.objectives,

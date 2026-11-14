@@ -99,6 +99,26 @@ class HackathonValidationTests(unittest.TestCase):
         self.assertEqual(artifact.decision_id, linked.decision_id)
         self.assertEqual(self.store.get_project_stage(self.project.project_id, ProjectStageKey.P3).status.value,
                          "completed")
+
+    def test_generic_p3_completion_cannot_bypass_persisted_decision(self):
+        self.store.start_project_stage(self.project.project_id, ProjectStageKey.P3)
+        with self.assertRaisesRegex(ValueError, "persisted validation decision"):
+            self.store.complete_project_stage(self.project.project_id, ProjectStageKey.P3)
+        with self.assertRaisesRegex(ValueError, "persisted validation decision"):
+            self.store.transition_project_stage(self.project.project_id, ProjectStageKey.P3, "completed")
+
+    def test_stop_decision_completes_but_rejected_decision_cannot_complete(self):
+        artifact, linked = save_validation_decision(self.store, self.project.project_id,
+            self.decision(ValidationOutcome.STOP, next_action="Stop this problem direction."))
+        self.assertEqual(self.store.get_project_stage(self.project.project_id, ProjectStageKey.P3).status.value,
+                         "completed")
+        self.store.record_artifact_approval(self.project.project_id, artifact.artifact_id,
+            ApprovalEventStatus.REJECTED, actor="reviewer", comment="Decision needs reconsideration")
+        self.store.record_decision_approval(self.project.project_id, linked.decision_id,
+            ApprovalEventStatus.REJECTED, actor="reviewer", comment="Decision needs reconsideration")
+        self.store.reopen_project_stage(self.project.project_id, ProjectStageKey.P3)
+        with self.assertRaisesRegex(ValueError, "rejected or changes-requested"):
+            self.store.complete_project_stage(self.project.project_id, ProjectStageKey.P3)
         self.assertEqual(self.store.get_project_stage(self.project.project_id, ProjectStageKey.P2).status.value,
                          "completed")
 
@@ -162,7 +182,14 @@ class HackathonValidationTests(unittest.TestCase):
         frame, decision = save_frame(self.store, self.project.project_id, revised)
         approve_frame(self.store, self.project.project_id, frame.artifact_id,
             decision.decision_id, ApprovalEventStatus.APPROVED)
-        with self.assertRaisesRegex(ValueError, "P2 research plan references an older P1 version"):
+        with self.assertRaisesRegex(ValueError, "approved P2 research report|older P1 version"):
+            validation_context(self.store, self.project.project_id)
+
+    def test_p3_rejects_a_report_invalidated_by_a_newer_p2_plan(self):
+        _plan, plan_artifact, plan_decision = create_research_plan(self.store, self.project.project_id)
+        self.store.approve_p2_artifact(self.project.project_id, plan_artifact.artifact_id,
+            plan_decision.decision_id, "research_plan", ApprovalEventStatus.APPROVED)
+        with self.assertRaisesRegex(ValueError, "approved P2 research report"):
             validation_context(self.store, self.project.project_id)
 
 

@@ -215,6 +215,36 @@ class HackathonWorkflowEndToEndTests(unittest.TestCase):
                                 if item.artifact_id == p8_artifact.artifact_id)
             self.assertEqual(json.loads(persisted_p8.content), json.loads(p8_artifact.content))
 
+            # A new P1 version reopens only work that depends on the old frame;
+            # every prior artifact remains available as historical evidence.
+            revised_frame = create_frame(ProblemInput(
+                title="Residents need earlier flood warnings",
+                description="Residents in low-lying neighborhoods need earlier, localized warning information to act safely.",
+                domain="Community emergency preparedness", geography="Low-lying neighborhoods",
+                primary_users=["Residents in flood-prone neighborhoods"],
+                unknowns=["Minimum useful warning lead time is not yet measured"]))
+            new_frame, new_frame_decision = save_frame(store, project_id, revised_frame)
+            approve_frame(store, project_id, new_frame.artifact_id, new_frame_decision.decision_id,
+                ApprovalEventStatus.APPROVED)
+            self.assertEqual([store.get_project_stage(project_id, stage).status.value
+                for stage in (ProjectStageKey.P1, ProjectStageKey.P2, ProjectStageKey.P3,
+                              ProjectStageKey.P4, ProjectStageKey.P5, ProjectStageKey.P6,
+                              ProjectStageKey.P7, ProjectStageKey.P8)],
+                ["completed", "in_progress", "in_progress", "in_progress", "in_progress",
+                 "in_progress", "in_progress", "in_progress"])
+            remaining_ids = {item.artifact_id for item in store.list_project_artifacts(project_id)}
+            self.assertTrue({frame.artifact_id, plan_artifact.artifact_id, report.artifact_id,
+                p4_artifact.artifact_id, p5_artifact.artifact_id, p6_artifact.artifact_id,
+                p7_artifact.artifact_id, p8_artifact.artifact_id}.issubset(remaining_ids))
+            for artifact in (plan_artifact, report, p4_artifact, p5_artifact, p6_artifact,
+                             p7_artifact, p8_artifact):
+                self.assertEqual(store.get_artifact_approval_status(project_id, artifact.artifact_id),
+                                 "changes_requested")
+            for key in (ProjectStageKey.P2, ProjectStageKey.P3, ProjectStageKey.P4,
+                        ProjectStageKey.P5, ProjectStageKey.P6, ProjectStageKey.P7,
+                        ProjectStageKey.P8):
+                self.assertTrue(store.get_project_stage_history(project_id, key))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -127,6 +127,7 @@ def validation_context(store: ProjectStore, project_id: str) -> dict:
             or plan_data.get("problem_frame_version") != frame.version):
         raise ValueError("The latest P2 research plan references an older P1 version. Revise and approve P2 before validation.")
     if (report_data.get("plan_artifact_id") != plan.artifact_id
+            or report_data.get("plan_artifact_version") != plan.version
             or report_data.get("plan_id") != plan_data.get("id")):
         raise ValueError("The latest P2 research report does not match the latest approved research plan. Rerun P2 before validation.")
     evidence_lines = []

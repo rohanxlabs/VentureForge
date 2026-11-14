@@ -2,8 +2,9 @@
 
 The stage services remain responsible for creating and approving domain artifacts.
 This graph provides a separate, checkpointed human gate between those stages. A
-small JSON control snapshot allows the graph to be reconstructed after restart;
-the user's project artifacts and stage history remain the source of truth.
+small JSON routing snapshot allows the coordinator to be reconstructed after
+restart; it does not persist LangGraph's interrupted execution state. The user's
+project artifacts and stage history remain the source of truth.
 """
 from __future__ import annotations
 
@@ -150,7 +151,7 @@ def _route_progress(state: HackathonWorkflowState) -> str:
 
 
 def build_hackathon_graph():
-    """Build a checkpointed orchestrator independent of the startup discovery graph."""
+    """Build an in-memory LangGraph coordinator independent of startup discovery."""
     graph = StateGraph(HackathonWorkflowState)
     graph.add_node("synchronize", _synchronize)
     graph.add_node("human_gate", _wait_for_human)

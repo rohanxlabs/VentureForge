@@ -110,6 +110,13 @@ class HackathonSolutionTests(unittest.TestCase):
         self.assertEqual(decision.selected_option_id, "option-1")
         self.assertEqual(self.store.get_project_stage(self.project.project_id, "P4").status.value, "completed")
 
+    def test_generic_p4_completion_cannot_bypass_approved_selection(self):
+        self.store.start_project_stage(self.project.project_id, "P4")
+        with self.assertRaisesRegex(ValueError, "persisted selected solution direction"):
+            self.store.complete_project_stage(self.project.project_id, "P4")
+        with self.assertRaisesRegex(ValueError, "persisted selected solution direction"):
+            self.store.transition_project_stage(self.project.project_id, "P4", "completed")
+
     def test_rubric_mapping_and_verified_evidence_references_are_enforced(self):
         option = self.make_options().options[0].model_copy(update={"evidence_ids": ["foreign-id"]})
         draft = self.make_options(options=[option, self.make_options().options[1]])

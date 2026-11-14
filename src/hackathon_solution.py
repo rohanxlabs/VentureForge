@@ -227,7 +227,8 @@ def record_solution_direction(store: ProjectStore, project_id: str, payload: str
     previous = latest_solution_options(store, project_id)
     artifact = store.create_artifact_version(project_id, previous.artifact_id, create) if previous else store.create_artifact(create)
     if draft.action == SolutionDirectionAction.SELECT:
-        store.complete_project_stage(project_id, ProjectStageKey.P4, note=stage_note)
+        store.approve_p4_solution_selection(project_id, artifact.artifact_id, decision.decision_id,
+            comment=stage_note)
     elif draft.action == SolutionDirectionAction.RETURN_TO_P3:
         if store.get_project_stage(project_id, ProjectStageKey.P3).status.value == "completed":
             store.reopen_project_stage(project_id, ProjectStageKey.P3, note=stage_note.strip())

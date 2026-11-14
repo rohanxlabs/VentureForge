@@ -13,6 +13,7 @@ from src.research.models import (
     ProjectWorkflowRun, WorkflowRunCreate, WorkflowRunEvent, WorkflowStatus,
     ProjectResearchRunSummary, ResearchPlan,
 )
+from src.research.dependencies import artifact_dependencies
 from src.research.storage import ResearchStore
 
 
@@ -40,6 +41,212 @@ class ProjectStore(ResearchStore):
             (event.approval_id, sequence, project_id, decision_id, artifact_id, status.value,
              actor, comment, event.created_at.isoformat()))
         return event
+
+    @staticmethod
+    def _latest_artifact_row(c, project_id: str, stage_key: str, artifact_type: str):
+        return c.execute("""SELECT * FROM project_artifacts WHERE project_id=? AND stage_key=?
+            AND artifact_type=? ORDER BY version DESC,created_at DESC,artifact_id DESC LIMIT 1""",
+            (project_id, stage_key, artifact_type)).fetchone()
+
+    def _validate_p3_completion_in_transaction(self, c, project_id: str) -> None:
+        from src.hackathon_validation import ValidationDecision, ValidationOutcome
+
+        p1 = c.execute("SELECT status FROM project_stages WHERE project_id=? AND stage_key='P1'",
+                       (project_id,)).fetchone()
+        p2 = c.execute("SELECT status FROM project_stages WHERE project_id=? AND stage_key='P2'",
+                       (project_id,)).fetchone()
+        if not p1 or p1["status"] != ProjectStageStatus.COMPLETED.value or not p2 or p2["status"] != ProjectStageStatus.COMPLETED.value:
+            raise ValueError("P3 requires completed P1 and P2 stages.")
+        frame = self._latest_artifact_row(c, project_id, "P1", "problem_frame")
+        plan = self._latest_artifact_row(c, project_id, "P2", "research_plan")
+        report = self._latest_artifact_row(c, project_id, "P2", "research_report")
+        decision_artifact = self._latest_artifact_row(c, project_id, "P3", "validation_decision")
+        if not all((frame, plan, report, decision_artifact)):
+            raise ValueError("P3 requires a persisted validation decision and its current P1/P2 artifacts.")
+        if any(item["status"] not in {ArtifactStatus.DRAFT.value, ArtifactStatus.READY.value}
+               for item in (frame, plan, report, decision_artifact)):
+            raise ValueError("P3 cannot complete from stale, superseded, or archived upstream artifacts.")
+        for item in (frame, plan, report):
+            approval = self._latest_approval_event(c, project_id=project_id, artifact_id=item["artifact_id"])
+            linked = self._latest_approval_event(c, project_id=project_id, decision_id=item["decision_id"]) if item["decision_id"] else None
+            if not approval or not linked or approval.status != linked.status or approval.status != ApprovalEventStatus.APPROVED:
+                raise ValueError("P3 requires the current P1 frame and P2 plan/report to remain approved.")
+        plan_data, report_data = (json.loads(item["content"] or "{}") for item in (plan, report))
+        if (plan_data.get("problem_frame_artifact_id") != frame["artifact_id"]
+                or plan_data.get("problem_frame_version") != frame["version"]
+                or report_data.get("plan_artifact_id") != plan["artifact_id"]
+                or report_data.get("plan_artifact_version") != plan["version"]
+                or report_data.get("plan_id") != plan_data.get("id")):
+            raise ValueError("P3 cannot complete with stale P1/P2 research lineage.")
+        linked = c.execute("SELECT * FROM decisions WHERE project_id=? AND decision_id=?",
+                           (project_id, decision_artifact["decision_id"])).fetchone() if decision_artifact["decision_id"] else None
+        if (linked is None or linked["stage_key"] != "P3" or linked["decision_type"] != "problem_validation"):
+            raise ValueError("P3 completion requires a linked problem-validation decision.")
+        try:
+            decision = ValidationDecision.model_validate_json(decision_artifact["content"] or "")
+        except Exception as exc:
+            raise ValueError("P3 completion requires a valid persisted validation decision.") from exc
+        if (linked["status"] != decision.outcome.value
+                or decision.outcome not in {ValidationOutcome.PROCEED, ValidationOutcome.STOP}
+                or decision.problem_frame_artifact_id != frame["artifact_id"]
+                or decision.problem_frame_version != frame["version"]
+                or decision.research_report_artifact_id != report["artifact_id"]
+                or decision.research_report_version != report["version"]):
+            raise ValueError("P3 completion requires a current proceed or stop decision tied to the latest P1/P2 versions.")
+        evidence_ids = {item.get("id") for item in report_data.get("evidence", []) if item.get("id")}
+        if not set(decision.supporting_evidence_ids + decision.contradicting_evidence_ids).issubset(evidence_ids):
+            raise ValueError("P3 validation decision cites evidence outside the current P2 report.")
+        for record_id in decision.primary_research_artifact_ids:
+            primary = c.execute("SELECT * FROM project_artifacts WHERE project_id=? AND artifact_id=?",
+                                (project_id, record_id)).fetchone()
+            if primary is None or primary["stage_key"] != "P3" or primary["artifact_type"] != "primary_research_record":
+                raise ValueError("P3 validation decision cites a missing or foreign primary research record.")
+            primary_data = json.loads(primary["content"] or "{}")
+            if (primary_data.get("problem_frame_artifact_id") != frame["artifact_id"]
+                    or primary_data.get("problem_frame_version") != frame["version"]):
+                raise ValueError("P3 validation decision cites a primary research record tied to stale P1 work.")
+        artifact_review = self._latest_approval_event(c, project_id=project_id,
+                                                       artifact_id=decision_artifact["artifact_id"])
+        decision_review = self._latest_approval_event(c, project_id=project_id,
+                                                        decision_id=decision_artifact["decision_id"])
+        if ((artifact_review is None) != (decision_review is None)
+                or (artifact_review and (artifact_review.status != ApprovalEventStatus.APPROVED
+                                         or decision_review.status != ApprovalEventStatus.APPROVED))):
+            raise ValueError("A rejected or changes-requested P3 decision cannot complete the stage.")
+
+    def _validate_p4_completion_in_transaction(self, c, project_id: str) -> None:
+        from src.hackathon_solution import SolutionDirectionAction, SolutionOptionsDraft
+
+        prerequisites = c.execute("""SELECT stage_key,status FROM project_stages WHERE project_id=?
+            AND stage_key IN ('P1','P2','P3')""", (project_id,)).fetchall()
+        if len(prerequisites) != 3 or any(row["status"] != ProjectStageStatus.COMPLETED.value for row in prerequisites):
+            raise ValueError("P4 requires completed P1, P2, and P3 stages.")
+        frame = self._latest_artifact_row(c, project_id, "P1", "problem_frame")
+        plan = self._latest_artifact_row(c, project_id, "P2", "research_plan")
+        report = self._latest_artifact_row(c, project_id, "P2", "research_report")
+        validation = self._latest_artifact_row(c, project_id, "P3", "validation_decision")
+        selected = self._latest_artifact_row(c, project_id, "P4", "solution_options")
+        if not all((frame, plan, report, validation, selected)):
+            raise ValueError("P4 requires a persisted selected solution direction and current P1-P3 artifacts.")
+        if any(item["status"] not in {ArtifactStatus.DRAFT.value, ArtifactStatus.READY.value}
+               for item in (frame, plan, report, validation, selected)):
+            raise ValueError("P4 cannot complete from stale, superseded, or archived artifacts.")
+        for item in (frame, plan, report):
+            approval = self._latest_approval_event(c, project_id=project_id, artifact_id=item["artifact_id"])
+            linked = self._latest_approval_event(c, project_id=project_id, decision_id=item["decision_id"]) if item["decision_id"] else None
+            if not approval or not linked or approval.status != linked.status or approval.status != ApprovalEventStatus.APPROVED:
+                raise ValueError("P4 requires current approved P1/P2 artifacts.")
+        plan_data = json.loads(plan["content"] or "{}")
+        report_data = json.loads(report["content"] or "{}")
+        if (plan_data.get("problem_frame_artifact_id") != frame["artifact_id"]
+                or plan_data.get("problem_frame_version") != frame["version"]
+                or report_data.get("plan_artifact_id") != plan["artifact_id"]
+                or report_data.get("plan_artifact_version") != plan["version"]):
+            raise ValueError("P4 cannot complete while P2 references stale upstream versions.")
+        try:
+            draft = SolutionOptionsDraft.model_validate_json(selected["content"] or "")
+        except Exception as exc:
+            raise ValueError("P4 completion requires a valid persisted solution comparison.") from exc
+        if (draft.action != SolutionDirectionAction.SELECT
+                or draft.selected_option_id not in {option.option_id for option in draft.options}):
+            raise ValueError("P4 can complete only with a persisted selection from the listed solution options.")
+        validation_data = json.loads(validation["content"] or "{}")
+        if validation_data.get("outcome") != "proceed":
+            raise ValueError("P4 requires a P3 proceed decision.")
+        exact_refs = (
+            draft.problem_frame_artifact_id == frame["artifact_id"] and draft.problem_frame_version == frame["version"],
+            draft.research_report_artifact_id == report["artifact_id"] and draft.research_report_version == report["version"],
+            draft.validation_decision_artifact_id == validation["artifact_id"] and draft.validation_decision_version == validation["version"],
+        )
+        if not all(exact_refs):
+            raise ValueError("P4 selection references stale P1-P3 versions.")
+        decision = c.execute("SELECT * FROM decisions WHERE project_id=? AND decision_id=?",
+                             (project_id, selected["decision_id"])).fetchone() if selected["decision_id"] else None
+        if (decision is None or decision["stage_key"] != "P4"
+                or decision["decision_type"] != "solution_direction" or decision["status"] != "selected"):
+            raise ValueError("P4 completion requires a linked persisted selection decision.")
+        validation_artifact_review = self._latest_approval_event(c, project_id=project_id,
+            artifact_id=validation["artifact_id"])
+        validation_decision_review = self._latest_approval_event(c, project_id=project_id,
+            decision_id=validation["decision_id"]) if validation["decision_id"] else None
+        if ((validation_artifact_review is None) != (validation_decision_review is None)
+                or (validation_artifact_review and (validation_artifact_review.status != ApprovalEventStatus.APPROVED
+                    or validation_decision_review.status != ApprovalEventStatus.APPROVED))):
+            raise ValueError("P4 cannot proceed from a rejected or changes-requested P3 decision.")
+        artifact_review = self._latest_approval_event(c, project_id=project_id, artifact_id=selected["artifact_id"])
+        decision_review = self._latest_approval_event(c, project_id=project_id, decision_id=selected["decision_id"])
+        if (not artifact_review or not decision_review
+                or artifact_review.status != ApprovalEventStatus.APPROVED
+                or decision_review.status != ApprovalEventStatus.APPROVED):
+            raise ValueError("P4 selection and its linked decision must both be approved before completion.")
+
+    def _invalidate_downstream_artifacts_in_transaction(self, c, project_id: str,
+            upstream_type: str, upstream_id: str, upstream_version: int) -> list[str]:
+        """Require renewed approval for the transitive dependants of one exact version."""
+        rows = c.execute("SELECT * FROM project_artifacts WHERE project_id=? ORDER BY version,created_at,artifact_id",
+                         (project_id,)).fetchall()
+        latest_by_key = {}
+        for row in rows:
+            prior = latest_by_key.get(row["artifact_key"])
+            if prior is None or row["version"] > prior["version"]:
+                latest_by_key[row["artifact_key"]] = row
+        candidates = [row for row in latest_by_key.values()
+                      if row["status"] in {ArtifactStatus.DRAFT.value, ArtifactStatus.READY.value}]
+        invalidated_refs = [(upstream_type, upstream_id, upstream_version)]
+        stale_rows = []
+        stale_ids = set()
+        while True:
+            found = []
+            for row in candidates:
+                if row["artifact_id"] in stale_ids:
+                    continue
+                refs = artifact_dependencies(row["artifact_type"], row["content"])
+                if any(ref_type == changed_type and ref_id == changed_id
+                       and ref_version == changed_version
+                       for changed_type, changed_id, changed_version in invalidated_refs
+                       for ref_type, ref_id, ref_version in refs):
+                    found.append(row)
+            if not found:
+                break
+            for row in found:
+                stale_ids.add(row["artifact_id"])
+                stale_rows.append(row)
+                invalidated_refs.append((row["artifact_type"], row["artifact_id"], row["version"]))
+
+        changed_stages = set()
+        for row in stale_rows:
+            reason = f"Upstream {upstream_type} v{upstream_version} changed; review this artifact against current dependencies."
+            self._insert_approval_event(c, project_id=project_id, artifact_id=row["artifact_id"],
+                status=ApprovalEventStatus.CHANGES_REQUESTED, actor="dependency_integrity", comment=reason)
+            if row["decision_id"]:
+                self._insert_approval_event(c, project_id=project_id, decision_id=row["decision_id"],
+                    status=ApprovalEventStatus.CHANGES_REQUESTED, actor="dependency_integrity", comment=reason)
+            if row["stage_key"]:
+                changed_stages.add(row["stage_key"])
+        for stage_key in sorted(changed_stages):
+            stage = c.execute("SELECT status FROM project_stages WHERE project_id=? AND stage_key=?",
+                              (project_id, stage_key)).fetchone()
+            if stage and stage["status"] in {ProjectStageStatus.COMPLETED.value, ProjectStageStatus.SKIPPED.value}:
+                self._transition_project_stage_in_transaction(c, project_id, stage_key,
+                    ProjectStageStatus.IN_PROGRESS, actor="dependency_integrity",
+                    note=f"Reopened because upstream {upstream_type} v{upstream_version} changed.",
+                    expected_from={ProjectStageStatus(stage["status"])})
+        return [row["artifact_id"] for row in stale_rows]
+
+    def _transition_project_stage_in_transaction(self, c, project_id, stage_key, to_status, *,
+            actor="user", note=None, reason=None, expected_from=None):
+        key = self._stage_key(stage_key)
+        target = ProjectStageStatus(to_status)
+        if key in {ProjectStageKey.P3, ProjectStageKey.P4} and target == ProjectStageStatus.SKIPPED:
+            raise ValueError(f"{key.value} cannot be skipped; record its required human decision first.")
+        return super()._transition_project_stage_in_transaction(c, project_id, key, target,
+            actor=actor, note=note, reason=reason, expected_from=expected_from)
+
+    def _validate_stage_completion_in_transaction(self, c, project_id, stage_key):
+        if stage_key == ProjectStageKey.P3:
+            self._validate_p3_completion_in_transaction(c, project_id)
+        elif stage_key == ProjectStageKey.P4:
+            self._validate_p4_completion_in_transaction(c, project_id)
 
     @staticmethod
     def _latest_approval_event(c, *, project_id: str, decision_id: str | None = None,
@@ -795,6 +1002,9 @@ class ProjectStore(ResearchStore):
                 VALUES(?,?,?,?,?,?,?,?,?,NULL,?,'draft',?,?)""",
                 (artifact_id, artifact_key, project_id, ProjectStageKey.P2.value, decision_id,
                  "research_plan", title, "Question-driven P2 research plan.", content, version, now, now))
+            if previous is not None:
+                self._invalidate_downstream_artifacts_in_transaction(c, project_id,
+                    "research_plan", previous["artifact_id"], previous["version"])
         artifact = self.get_artifact(project_id, artifact_id)
         return plan, artifact, self.get_decision(project_id, decision_id)
 
@@ -842,6 +1052,9 @@ class ProjectStore(ResearchStore):
                 VALUES(?,?,?,?,?,?,?,?,?,NULL,?,'draft',?,?)""",
                 (artifact_id, artifact_key, project_id, ProjectStageKey.P2.value, decision_id,
                  "research_report", title, "Source traceable P2 research output.", content, version, now, now))
+            if previous is not None:
+                self._invalidate_downstream_artifacts_in_transaction(c, project_id,
+                    "research_report", previous["artifact_id"], previous["version"])
             c.execute("UPDATE workflow_runs SET status='completed',completed_at=?,output_artifact_id=? WHERE workflow_run_id=? AND status='running'",
                       (now, artifact_id, workflow_run_id))
             self._add_workflow_event(c, workflow_run_id, WorkflowStatus.RUNNING,
@@ -1241,6 +1454,8 @@ class ProjectStore(ResearchStore):
             if previous is not None:
                 c.execute("UPDATE project_artifacts SET status='superseded',updated_at=? WHERE project_id=? AND artifact_id=? AND status=?",
                           (now,artifact.project_id,previous["artifact_id"],previous["status"]))
+                self._invalidate_downstream_artifacts_in_transaction(c, artifact.project_id,
+                    artifact.artifact_type, previous["artifact_id"], previous["version"])
         return self.get_artifact(artifact.project_id, artifact_id)
 
     def create_artifact_version(self, project_id: str, artifact_id: str, artifact: ArtifactCreate) -> ProjectArtifact:
@@ -1249,6 +1464,41 @@ class ProjectStore(ResearchStore):
         current = self.get_artifact(project_id, artifact_id)
         return self.create_artifact(artifact, artifact_key=current.artifact_key,
                                     _expected_previous_id=current.artifact_id)
+
+    def approve_p4_solution_selection(self, project_id: str, artifact_id: str, decision_id: str,
+                                      *, actor: str = "user", comment: str = "Human selected this solution direction."):
+        """Approve a human P4 selection and complete P4 atomically."""
+        if not actor.strip():
+            raise ValueError("Approval actor cannot be empty.")
+        with self.db() as c:
+            c.execute("BEGIN IMMEDIATE")
+            project = self._require_project(c, project_id, writable=True)
+            if project["status"] != ProjectStatus.ACTIVE.value:
+                raise ValueError("P4 selection can only be approved for an active project.")
+            artifact = c.execute("SELECT * FROM project_artifacts WHERE project_id=? AND artifact_id=?",
+                                 (project_id, artifact_id)).fetchone()
+            latest = self._latest_artifact_row(c, project_id, "P4", "solution_options")
+            decision = c.execute("SELECT * FROM decisions WHERE project_id=? AND decision_id=?",
+                                 (project_id, decision_id)).fetchone()
+            if (artifact is None or latest is None or latest["artifact_id"] != artifact_id
+                    or artifact["stage_key"] != "P4" or artifact["artifact_type"] != "solution_options"
+                    or artifact["decision_id"] != decision_id or artifact["status"] not in {"draft", "ready"}):
+                raise ValueError("Only the latest active P4 selection artifact can be approved.")
+            if (decision is None or decision["stage_key"] != "P4"
+                    or decision["decision_type"] != "solution_direction" or decision["status"] != "selected"):
+                raise ValueError("The P4 approval decision is not a persisted solution selection.")
+            stage = c.execute("SELECT status FROM project_stages WHERE project_id=? AND stage_key='P4'",
+                              (project_id,)).fetchone()
+            if stage is None or stage["status"] != ProjectStageStatus.IN_PROGRESS.value:
+                raise ValueError("P4 must be in progress before approving a selection.")
+            self._insert_approval_event(c, project_id=project_id, artifact_id=artifact_id,
+                status=ApprovalEventStatus.APPROVED, actor=actor.strip(), comment=comment)
+            self._insert_approval_event(c, project_id=project_id, decision_id=decision_id,
+                status=ApprovalEventStatus.APPROVED, actor=actor.strip(), comment=comment)
+            self._transition_project_stage_in_transaction(c, project_id, ProjectStageKey.P4,
+                ProjectStageStatus.COMPLETED, actor=actor.strip(), note="Human-approved solution selection.",
+                expected_from={ProjectStageStatus.IN_PROGRESS})
+        return self.get_project_stage(project_id, ProjectStageKey.P4)
 
     def get_artifact(self, project_id: str, artifact_id: str) -> ProjectArtifact:
         with self.db() as c:

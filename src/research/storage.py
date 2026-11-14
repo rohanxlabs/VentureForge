@@ -668,6 +668,8 @@ class ResearchStore:
             raise ValueError("Stage transition actor cannot be empty.")
         if target == ProjectStageStatus.SKIPPED and (reason is None or not reason.strip()):
             raise ValueError("A non-empty reason is required to skip a stage.")
+        if target == ProjectStageStatus.SKIPPED and key in {ProjectStageKey.P3, ProjectStageKey.P4}:
+            raise ValueError(f"{key.value} cannot be skipped; record its required human decision first.")
 
         now = datetime.now(timezone.utc).isoformat()
         project = self._project_row(c, project_id)
@@ -683,6 +685,8 @@ class ResearchStore:
             raise ValueError(f"Stage {key.value} must be in {allowed} for this operation; it is {current.value}.")
         if target not in _STAGE_TRANSITIONS[current]:
             raise ValueError(f"Invalid stage transition for {key.value}: {current.value} -> {target.value}.")
+        if target == ProjectStageStatus.COMPLETED:
+            self._validate_stage_completion_in_transaction(c, project_id, key)
 
         transition_note = reason.strip() if target == ProjectStageStatus.SKIPPED else (note or "").strip()
         if current in {ProjectStageStatus.COMPLETED, ProjectStageStatus.SKIPPED} and target == ProjectStageStatus.IN_PROGRESS and not transition_note:
@@ -700,6 +704,13 @@ class ResearchStore:
         updated = c.execute("SELECT * FROM project_stages WHERE project_id=? AND stage_key=?",
                             (project_id, key.value)).fetchone()
         return ProjectStage.model_validate(dict(updated))
+
+    def _validate_stage_completion_in_transaction(
+        self, c: sqlite3.Connection, project_id: str, stage_key: ProjectStageKey,
+    ) -> None:
+        """Fail closed for hackathon stages that require ProjectStore domain checks."""
+        if stage_key in {ProjectStageKey.P3, ProjectStageKey.P4}:
+            raise ValueError(f"{stage_key.value} completion requires ProjectStore workflow validation.")
 
     def start_project_stage(self, project_id: str, stage_key: str | ProjectStageKey, *, actor: str = "user") -> ProjectStage:
         return self.transition_project_stage(project_id, stage_key, ProjectStageStatus.IN_PROGRESS,
