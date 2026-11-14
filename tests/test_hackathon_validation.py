@@ -19,6 +19,7 @@ from src.project_store import ProjectStore
 from src.research.budget import SearchBudget
 from src.research.models import (
     ApprovalEventStatus,
+    ArtifactCreate,
     CandidateExtraction,
     ProjectCreate,
     ProjectStageKey,
@@ -119,6 +120,14 @@ class HackathonValidationTests(unittest.TestCase):
         self.store.reopen_project_stage(self.project.project_id, ProjectStageKey.P3)
         with self.assertRaisesRegex(ValueError, "rejected or changes-requested"):
             self.store.complete_project_stage(self.project.project_id, ProjectStageKey.P3)
+        self.store.record_artifact_approval(self.project.project_id, artifact.artifact_id,
+            ApprovalEventStatus.CHANGES_REQUESTED, actor="reviewer", comment="Revise the rationale")
+        self.store.record_decision_approval(self.project.project_id, linked.decision_id,
+            ApprovalEventStatus.CHANGES_REQUESTED, actor="reviewer", comment="Revise the rationale")
+        with self.assertRaisesRegex(ValueError, "rejected or changes-requested"):
+            self.store.complete_project_stage(self.project.project_id, ProjectStageKey.P3)
+        self.assertEqual(len(self.store.get_artifact_approval_history(self.project.project_id,
+            artifact.artifact_id)), 2)
         self.assertEqual(self.store.get_project_stage(self.project.project_id, ProjectStageKey.P2).status.value,
                          "completed")
 
@@ -153,6 +162,15 @@ class HackathonValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must match evidence IDs"):
             save_validation_decision(self.store, self.project.project_id, decision)
 
+    def test_validation_decision_rejects_a_primary_record_from_another_project(self):
+        other = self.store.create_project(ProjectCreate(name="Other primary research project"))
+        foreign = self.store.create_artifact(ArtifactCreate(project_id=other.project_id,
+            stage_key=ProjectStageKey.P3, artifact_type="primary_research_record",
+            title="Foreign interview", content="{}"))
+        decision = self.decision(primary_research_artifact_ids=[foreign.artifact_id])
+        with self.assertRaisesRegex(ValueError, "must match saved records for this project"):
+            save_validation_decision(self.store, self.project.project_id, decision)
+
     def test_structured_primary_research_is_saved_and_linked_to_p3_decision(self):
         context = validation_context(self.store, self.project.project_id)
         record = PrimaryResearchRecord(method=PrimaryResearchMethod.INTERVIEW,
@@ -175,6 +193,22 @@ class HackathonValidationTests(unittest.TestCase):
         self.assertEqual(json.loads(saved.content)["primary_research_artifact_ids"],
                          [artifact.artifact_id])
 
+        self.store.reopen_project_stage(self.project.project_id, ProjectStageKey.P3)
+        revised_record = self.store.create_artifact_version(self.project.project_id, artifact.artifact_id,
+            ArtifactCreate(project_id=self.project.project_id, stage_key=ProjectStageKey.P3,
+                artifact_type="primary_research_record", title="Revised interview record",
+                content=artifact.content))
+        self.assertEqual(self.store.get_artifact_approval_status(self.project.project_id,
+            saved.artifact_id), "changes_requested")
+        self.assertEqual(self.store.get_decision_approval_status(self.project.project_id,
+            saved.decision_id), "changes_requested")
+        with self.assertRaisesRegex(ValueError, "missing or foreign primary research record"):
+            self.store.complete_project_stage(self.project.project_id, ProjectStageKey.P3)
+        with self.assertRaisesRegex(ValueError, "superseded or archived"):
+            save_validation_decision(self.store, self.project.project_id,
+                self.decision(primary_research_artifact_ids=[artifact.artifact_id]))
+        self.assertNotEqual(artifact.artifact_id, revised_record.artifact_id)
+
     def test_p3_rejects_an_approved_p2_plan_linked_to_an_older_p1_frame(self):
         revised = create_frame(ProblemInput(title="Warning delays",
             description="Residents in remote areas receive local warnings too late.",
@@ -190,6 +224,30 @@ class HackathonValidationTests(unittest.TestCase):
         self.store.approve_p2_artifact(self.project.project_id, plan_artifact.artifact_id,
             plan_decision.decision_id, "research_plan", ApprovalEventStatus.APPROVED)
         with self.assertRaisesRegex(ValueError, "approved P2 research report"):
+            validation_context(self.store, self.project.project_id)
+
+    def test_p3_requires_report_to_reference_exact_approved_plan_id_and_version(self):
+        plan = next(item for item in self.store.list_project_artifacts(self.project.project_id)
+                    if item.artifact_type == "research_plan")
+        report = self.store.get_artifact(self.project.project_id, self.report.artifact_id)
+        payload = json.loads(report.content)
+        payload["plan_artifact_id"] = "another-plan-id"
+        wrong_id = self.store.create_artifact_version(self.project.project_id, report.artifact_id,
+            ArtifactCreate(project_id=self.project.project_id, stage_key=ProjectStageKey.P2,
+                artifact_type="research_report", title="Report with wrong plan ID", content=json.dumps(payload)))
+        self.store.record_artifact_approval(self.project.project_id, wrong_id.artifact_id,
+            ApprovalEventStatus.APPROVED, actor="reviewer")
+        with self.assertRaisesRegex(ValueError, "does not match the latest approved research plan"):
+            validation_context(self.store, self.project.project_id)
+
+        payload["plan_artifact_id"] = plan.artifact_id
+        payload["plan_artifact_version"] = plan.version + 1
+        wrong_version = self.store.create_artifact_version(self.project.project_id, wrong_id.artifact_id,
+            ArtifactCreate(project_id=self.project.project_id, stage_key=ProjectStageKey.P2,
+                artifact_type="research_report", title="Report with wrong plan version", content=json.dumps(payload)))
+        self.store.record_artifact_approval(self.project.project_id, wrong_version.artifact_id,
+            ApprovalEventStatus.APPROVED, actor="reviewer")
+        with self.assertRaisesRegex(ValueError, "does not match the latest approved research plan"):
             validation_context(self.store, self.project.project_id)
 
 

@@ -210,6 +210,8 @@ def save_validation_decision(store: ProjectStore, project_id: str,
     for artifact_id in decision.primary_research_artifact_ids:
         primary = store.get_artifact(project_id, artifact_id)
         primary_data = json.loads(primary.content or "{}")
+        if primary.status.value not in {"draft", "ready"}:
+            raise ValueError("A selected primary research record has been superseded or archived.")
         if (primary_data.get("problem_frame_artifact_id") != frame.artifact_id
                 or primary_data.get("problem_frame_version") != frame.version):
             raise ValueError("A selected primary research record references an older P1 version.")

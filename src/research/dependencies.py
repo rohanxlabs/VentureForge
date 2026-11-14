@@ -7,12 +7,15 @@ from typing import Any
 # Keys map a persisted artifact type to (upstream artifact type, content ID key,
 # content version key). IDs are unique per artifact version; versions are kept
 # alongside IDs so consumers can detect malformed or legacy lineage explicitly.
-_DEPENDENCY_FIELDS: dict[str, tuple[tuple[str, str, str], ...]] = {
+_DEPENDENCY_FIELDS: dict[str, tuple[tuple[str, str, str | None], ...]] = {
     "research_plan": (("problem_frame", "problem_frame_artifact_id", "problem_frame_version"),),
     "research_report": (("research_plan", "plan_artifact_id", "plan_artifact_version"),),
     "validation_decision": (
         ("problem_frame", "problem_frame_artifact_id", "problem_frame_version"),
         ("research_report", "research_report_artifact_id", "research_report_version"),
+        # Primary research records are referenced as exact, version-specific IDs
+        # in ValidationDecision.primary_research_artifact_ids.
+        ("primary_research_record", "primary_research_artifact_ids", None),
     ),
     "primary_research_record": (("problem_frame", "problem_frame_artifact_id", "problem_frame_version"),),
     "solution_options": (
@@ -62,11 +65,18 @@ def artifact_dependencies(artifact_type: str, content: str | dict[str, Any] | No
         return []
     result = []
     for upstream_type, id_key, version_key in _DEPENDENCY_FIELDS.get(artifact_type, ()):
-        artifact_id = payload.get(id_key)
-        if not isinstance(artifact_id, str) or not artifact_id:
+        artifact_ids = payload.get(id_key)
+        if version_key is None:
+            if not isinstance(artifact_ids, list):
+                continue
+            for artifact_id in artifact_ids:
+                if isinstance(artifact_id, str) and artifact_id:
+                    result.append((upstream_type, artifact_id, None))
+            continue
+        if not isinstance(artifact_ids, str) or not artifact_ids:
             continue
         version = payload.get(version_key)
-        result.append((upstream_type, artifact_id, version if isinstance(version, int) else None))
+        result.append((upstream_type, artifact_ids, version if isinstance(version, int) else None))
     return result
 
 

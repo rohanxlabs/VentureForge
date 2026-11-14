@@ -111,11 +111,55 @@ class HackathonSolutionTests(unittest.TestCase):
         self.assertEqual(self.store.get_project_stage(self.project.project_id, "P4").status.value, "completed")
 
     def test_generic_p4_completion_cannot_bypass_approved_selection(self):
+        import contextlib
+        import io
+        from src import research_cli
+
         self.store.start_project_stage(self.project.project_id, "P4")
         with self.assertRaisesRegex(ValueError, "persisted selected solution direction"):
             self.store.complete_project_stage(self.project.project_id, "P4")
         with self.assertRaisesRegex(ValueError, "persisted selected solution direction"):
             self.store.transition_project_stage(self.project.project_id, "P4", "completed")
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            result = research_cli.main(["project", "stage", "complete", self.project.project_id,
+                "P4", "--database", str(self.store.path)])
+        self.assertEqual(result, 2)
+        self.assertIn("persisted selected solution direction", errors.getvalue())
+
+    def test_p4_rejected_changes_requested_and_cross_project_selection_cannot_complete(self):
+        selected = self.make_options(action=SolutionDirectionAction.SELECT, selected_option_id="option-1",
+            selection_rationale="This option best fits the current evidence and event constraints.",
+            experiment_owner="Team member A", experiment_timebox="First six hours")
+        _draft, artifact, decision = record_solution_direction(self.store, self.project.project_id,
+            selected.model_dump_json())
+        other = self.store.create_project(ProjectCreate(name="Other selection project"))
+        with self.assertRaisesRegex(ValueError, "latest active P4 selection"):
+            self.store.approve_p4_solution_selection(other.project_id, artifact.artifact_id,
+                decision.decision_id)
+        self.store.reopen_project_stage(self.project.project_id, "P4")
+        self.store.record_artifact_approval(self.project.project_id, artifact.artifact_id,
+            ApprovalEventStatus.REJECTED, actor="reviewer", comment="Reject this selection")
+        self.store.record_decision_approval(self.project.project_id, decision.decision_id,
+            ApprovalEventStatus.REJECTED, actor="reviewer", comment="Reject this selection")
+        with self.assertRaisesRegex(ValueError, "must both be approved"):
+            self.store.complete_project_stage(self.project.project_id, "P4")
+        self.store.record_artifact_approval(self.project.project_id, artifact.artifact_id,
+            ApprovalEventStatus.CHANGES_REQUESTED, actor="reviewer", comment="Revise selection")
+        self.store.record_decision_approval(self.project.project_id, decision.decision_id,
+            ApprovalEventStatus.CHANGES_REQUESTED, actor="reviewer", comment="Revise selection")
+        with self.assertRaisesRegex(ValueError, "must both be approved"):
+            self.store.transition_project_stage(self.project.project_id, "P4", "completed")
+
+    def test_p4_stale_latest_draft_cannot_complete(self):
+        selected = self.make_options(action=SolutionDirectionAction.SELECT, selected_option_id="option-1",
+            selection_rationale="This option best fits the current evidence and event constraints.",
+            experiment_owner="Team member A", experiment_timebox="First six hours")
+        _decision, _artifact, _linked = record_solution_direction(self.store, self.project.project_id,
+            selected.model_dump_json())
+        save_solution_options(self.store, self.project.project_id, self.make_options().model_dump_json())
+        with self.assertRaisesRegex(ValueError, "persisted selection from the listed solution options"):
+            self.store.complete_project_stage(self.project.project_id, "P4")
 
     def test_rubric_mapping_and_verified_evidence_references_are_enforced(self):
         option = self.make_options().options[0].model_copy(update={"evidence_ids": ["foreign-id"]})

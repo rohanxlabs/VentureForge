@@ -99,8 +99,14 @@ class ProjectStore(ResearchStore):
         for record_id in decision.primary_research_artifact_ids:
             primary = c.execute("SELECT * FROM project_artifacts WHERE project_id=? AND artifact_id=?",
                                 (project_id, record_id)).fetchone()
-            if primary is None or primary["stage_key"] != "P3" or primary["artifact_type"] != "primary_research_record":
+            if (primary is None or primary["stage_key"] != "P3"
+                    or primary["artifact_type"] != "primary_research_record"
+                    or primary["status"] not in {ArtifactStatus.DRAFT.value, ArtifactStatus.READY.value}):
                 raise ValueError("P3 validation decision cites a missing or foreign primary research record.")
+            latest_primary = c.execute("SELECT artifact_id FROM project_artifacts WHERE project_id=? AND artifact_key=? ORDER BY version DESC LIMIT 1",
+                (project_id, primary["artifact_key"])).fetchone()
+            if latest_primary is None or latest_primary["artifact_id"] != record_id:
+                raise ValueError("P3 validation decision cites a superseded primary research record.")
             primary_data = json.loads(primary["content"] or "{}")
             if (primary_data.get("problem_frame_artifact_id") != frame["artifact_id"]
                     or primary_data.get("problem_frame_version") != frame["version"]):
@@ -202,7 +208,9 @@ class ProjectStore(ResearchStore):
                     continue
                 refs = artifact_dependencies(row["artifact_type"], row["content"])
                 if any(ref_type == changed_type and ref_id == changed_id
-                       and ref_version == changed_version
+                       # A version-specific artifact ID is itself an exact
+                       # reference when its payload schema has no version field.
+                       and (ref_version is None or ref_version == changed_version)
                        for changed_type, changed_id, changed_version in invalidated_refs
                        for ref_type, ref_id, ref_version in refs):
                     found.append(row)
@@ -483,6 +491,24 @@ class ProjectStore(ResearchStore):
                 report_data = json.loads(artifact["content"] or "{}")
                 if status == ApprovalEventStatus.APPROVED and report_data.get("outcome", {}).get("execution_status") != "complete":
                     raise ValueError("A partial research report can be reviewed, but cannot complete P2. Run the approved plan again to address execution failures.")
+                if status == ApprovalEventStatus.APPROVED:
+                    plan_artifact = self._latest_artifact_row(c, project_id, "P2", "research_plan")
+                    if (plan_artifact is None
+                            or report_data.get("plan_artifact_id") != plan_artifact["artifact_id"]
+                            or report_data.get("plan_artifact_version") != plan_artifact["version"]):
+                        raise ValueError("P2 report must reference the exact latest approved research plan ID and version.")
+                    plan_approval = self._latest_approval_event(c, project_id=project_id,
+                        artifact_id=plan_artifact["artifact_id"])
+                    plan_decision_approval = (self._latest_approval_event(c, project_id=project_id,
+                        decision_id=plan_artifact["decision_id"]) if plan_artifact["decision_id"] else None)
+                    plan_data = json.loads(plan_artifact["content"] or "{}")
+                    persisted_plan = c.execute("SELECT status FROM research_plans WHERE plan_id=?",
+                        (plan_data.get("id"),)).fetchone()
+                    if (not plan_approval or not plan_decision_approval
+                            or plan_approval.status != ApprovalEventStatus.APPROVED
+                            or plan_decision_approval.status != ApprovalEventStatus.APPROVED
+                            or persisted_plan is None or persisted_plan["status"] != "approved"):
+                        raise ValueError("P2 report approval requires its exact research plan to remain approved.")
                 run_id = report_data.get("run_id")
                 run = c.execute("SELECT project_id FROM research_runs WHERE id=?", (run_id,)).fetchone()
                 if run is None or run["project_id"] != project_id:

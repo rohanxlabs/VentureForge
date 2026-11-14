@@ -14,8 +14,9 @@ from src.problem_intelligence import ProblemInput, approve_frame, create_frame, 
 from src.project_store import ProjectStore
 from src.research.budget import SearchBudget
 from src.research.models import (
-    ApprovalEventStatus, CandidateExtraction, ProjectCreate, ProjectStageKey,
+    ApprovalEventStatus, ArtifactCreate, CandidateExtraction, DecisionCreate, ProjectCreate, ProjectStageKey,
     QuestionPriority, ResearchQuestion, SourceSnapshot, SupportRelation, VerificationStatus,
+    WorkflowRunCreate,
 )
 from src.research.pipeline import CollectionUnavailableError
 from src.research.project_intelligence import (
@@ -343,6 +344,36 @@ class ProjectResearchIntelligenceTests(unittest.TestCase):
         self.assertEqual(len(self.store.list_project_workflows(self.project.project_id)), workflows_before)
         with self.store.db() as c:
             self.assertEqual(c.execute("SELECT COUNT(*) FROM evidence").fetchone()[0], evidence_before)
+
+    def test_report_approval_rejects_wrong_plan_id_or_version(self):
+        _plan, plan_artifact, plan_decision = self.make_plan()
+        self.approve_plan(plan_artifact, plan_decision)
+        _execution, report, _report_decision, _workflow = execute_project_research(
+            self.store, self.project.project_id, orchestrator=SyntheticOrchestrator(),
+            max_rounds=1, extractor=synthetic_extractor)
+        original = json.loads(report.content)
+        latest_report = report
+        for field, wrong_value in (("plan_artifact_id", "not-the-approved-plan"),
+                                   ("plan_artifact_version", plan_artifact.version + 1)):
+            payload = dict(original)
+            payload[field] = wrong_value
+            linked = self.store.create_decision(DecisionCreate(project_id=self.project.project_id,
+                stage_key=ProjectStageKey.P2, title=f"Review invalid report {field}",
+                decision_type="research_report", status="ready_for_review"))
+            invalid = self.store.create_artifact_version(self.project.project_id, latest_report.artifact_id,
+                ArtifactCreate(project_id=self.project.project_id, stage_key=ProjectStageKey.P2,
+                    decision_id=linked.decision_id, artifact_type="research_report",
+                    title="Invalid lineage report", content=json.dumps(payload)))
+            latest_report = invalid
+            workflow = self.store.start_workflow_run(WorkflowRunCreate(project_id=self.project.project_id,
+                stage_key=ProjectStageKey.P2, workflow_type="test_report_lineage",
+                input_ref=plan_artifact.artifact_id))
+            self.store.complete_workflow_run(self.project.project_id, workflow.workflow_run_id,
+                output_artifact_id=invalid.artifact_id)
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError,
+                    "exact latest approved research plan ID and version"):
+                self.store.approve_p2_artifact(self.project.project_id, invalid.artifact_id,
+                    linked.decision_id, "research_report", ApprovalEventStatus.APPROVED)
 
     def test_cross_project_plan_and_missing_plan_rejected(self):
         with self.assertRaisesRegex(ValueError, "No P2 research plan"):
