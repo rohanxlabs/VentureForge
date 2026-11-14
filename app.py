@@ -20,6 +20,13 @@ from src.run_controller import (
     start_run,
 )
 from src.state.schema import PipelineStage
+from src.hackathon_intake import build_challenge_setup_ui
+from src.hackathon_problem_ui import build_problem_framing_ui
+from src.hackathon_research_ui import build_research_ui
+from src.hackathon_validation_ui import build_problem_validation_ui
+from src.hackathon_solution_ui import build_solution_intelligence_ui
+from src.hackathon_engineering_ui import build_solution_engineering_ui
+from src.hackathon_execution_ui import build_mvp_execution_ui
 
 
 # =============================================================================
@@ -551,13 +558,21 @@ def clear_cache() -> str:
 
 def create_ui() -> gr.Blocks:
     """Create and return the Gradio UI."""
-    with gr.Blocks(title="VentureForge - AI Startup Discovery") as app:
+    with gr.Blocks(title="VentureForge - Hackathon Workspace") as app:
+        project_selector = build_challenge_setup_ui(gr)
+        build_problem_framing_ui(gr, project_selector)
+        build_research_ui(gr, project_selector)
+        build_problem_validation_ui(gr, project_selector)
+        build_solution_intelligence_ui(gr, project_selector)
+        build_solution_engineering_ui(gr, project_selector)
+        build_mvp_execution_ui(gr, project_selector)
+
         gr.Markdown(
             """
             # 🚀 VentureForge
-            ### AI-Powered Startup Discovery System
+            ### Optional: Startup Idea Discovery
 
-            Enter a domain to discover startup ideas using autonomous multi-agent analysis.
+            Use this separate tool to explore ideas when your hackathon challenge is open-ended.
             """
         )
 

@@ -1,0 +1,134 @@
+import tempfile
+import unittest
+from pathlib import Path
+
+from pydantic import ValidationError
+
+from src.hackathon_validation import (
+    ValidationDecision,
+    ValidationOutcome,
+    save_validation_decision,
+    validation_context,
+)
+from src.problem_intelligence import ProblemInput, approve_frame, create_frame, create_research_plan, save_frame
+from src.project_store import ProjectStore
+from src.research.budget import SearchBudget
+from src.research.models import (
+    ApprovalEventStatus,
+    CandidateExtraction,
+    ProjectCreate,
+    ProjectStageKey,
+    SourceSnapshot,
+    SupportRelation,
+)
+from src.research.project_intelligence import execute_project_research
+from src.research.search import CollectionResult
+
+
+class SyntheticOrchestrator:
+    def collect(self, *, run_id, prompt, questions, budget):
+        return CollectionResult(sources=[SourceSnapshot(run_id=run_id,
+            question_id=question.id, url=f"https://source-{index}.example.test/evidence",
+            title=f"Synthetic source {index}", content=f"Synthetic passage {index}.")
+            for index, question in enumerate(questions)], searches_attempted=len(questions),
+            searches_succeeded=len(questions), searches_failed=0)
+
+
+def synthetic_extractor(question, source):
+    return CandidateExtraction(relevant=True, claim=f"Finding for {question}",
+        passage=source.content, relation=SupportRelation.SUPPORTS)
+
+
+class HackathonValidationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.store = ProjectStore(Path(self.temp.name) / "validation.sqlite")
+        self.project = self.store.create_project(ProjectCreate(name="P3 validation"))
+        frame = create_frame(ProblemInput(title="Delayed local warnings",
+            description="Residents receive local hazard warnings too late to reach safety.",
+            primary_users=["Residents in hazard-prone areas"],
+            unknowns=["Warning lead time has not been measured"]))
+        self.frame, frame_decision = save_frame(self.store, self.project.project_id, frame)
+        approve_frame(self.store, self.project.project_id, self.frame.artifact_id,
+            frame_decision.decision_id, ApprovalEventStatus.APPROVED)
+        plan, plan_artifact, plan_decision = create_research_plan(self.store, self.project.project_id)
+        self.store.approve_p2_artifact(self.project.project_id, plan_artifact.artifact_id,
+            plan_decision.decision_id, "research_plan", ApprovalEventStatus.APPROVED)
+        _, self.report, report_decision, _ = execute_project_research(self.store, self.project.project_id,
+            budget=SearchBudget(max_search_calls=8, max_pages=20, max_tavily_credits=8, max_seconds=20),
+            orchestrator=SyntheticOrchestrator(), max_rounds=1, extractor=synthetic_extractor)
+        self.store.approve_p2_artifact(self.project.project_id, self.report.artifact_id,
+            report_decision.decision_id, "research_report", ApprovalEventStatus.APPROVED)
+        context = validation_context(self.store, self.project.project_id)
+        self.evidence_id = next(iter(context["evidence_ids"]))
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def decision(self, outcome=ValidationOutcome.PROCEED, **updates):
+        context = validation_context(self.store, self.project.project_id)
+        values = dict(outcome=outcome, rationale="The evidence supports a focused next step, with important uncertainty remaining.",
+            supporting_evidence_ids=[self.evidence_id], contradicting_evidence_ids=[],
+            first_hand_evidence="No direct user interviews have been conducted yet.",
+            evidence_limitations="Synthetic test data; the real project must review source quality.",
+            unresolved_questions=["How early must the warning arrive?"],
+            confidence="Low to moderate; desk evidence does not measure local behavior.",
+            next_action="Test the framing with affected residents before selecting a solution.",
+            evidence_method="", evidence_owner="", evidence_timebox="",
+            problem_frame_artifact_id=context["frame"].artifact_id,
+            problem_frame_version=context["frame"].version,
+            research_report_artifact_id=context["report"].artifact_id,
+            research_report_version=context["report"].version)
+        values.update(updates)
+        return ValidationDecision(**values)
+
+    def test_context_shows_upstream_versions_sources_evidence_and_gaps(self):
+        context = validation_context(self.store, self.project.project_id)
+        self.assertIn("Problem Frame v1", context["frame_view"])
+        self.assertIn("Research Report v1", context["report_view"])
+        self.assertIn(self.evidence_id, context["report_view"])
+        self.assertIn("Unanswered questions", context["report_view"])
+
+    def test_proceed_records_human_decision_and_completes_p3(self):
+        artifact, linked = save_validation_decision(self.store, self.project.project_id, self.decision())
+        self.assertEqual(artifact.artifact_type, "validation_decision")
+        self.assertEqual(artifact.decision_id, linked.decision_id)
+        self.assertEqual(self.store.get_project_stage(self.project.project_id, ProjectStageKey.P3).status.value,
+                         "completed")
+        self.assertEqual(self.store.get_project_stage(self.project.project_id, ProjectStageKey.P2).status.value,
+                         "completed")
+
+    def test_gather_more_evidence_reopens_p2_and_requires_owner_method_timebox(self):
+        with self.assertRaises(ValidationError):
+            self.decision(ValidationOutcome.GATHER_MORE_EVIDENCE)
+        decision = self.decision(ValidationOutcome.GATHER_MORE_EVIDENCE,
+            evidence_method="Interview warning recipients", evidence_owner="Team member A",
+            evidence_timebox="Before the next review")
+        save_validation_decision(self.store, self.project.project_id, decision)
+        self.assertEqual(self.store.get_project_stage(self.project.project_id, ProjectStageKey.P2).status.value,
+                         "in_progress")
+        self.assertEqual(self.store.get_project_stage(self.project.project_id, ProjectStageKey.P3).status.value,
+                         "in_progress")
+
+    def test_reframe_reopens_p1_and_rejects_stale_upstream_ids(self):
+        stale = self.decision(ValidationOutcome.REFRAME,
+            next_action="Narrow the target user to volunteer responders.")
+        stale.problem_frame_version = 2
+        with self.assertRaisesRegex(ValueError, "P1/P2 changed"):
+            save_validation_decision(self.store, self.project.project_id, stale)
+        current = self.decision(ValidationOutcome.REFRAME,
+            next_action="Narrow the target user to volunteer responders.")
+        save_validation_decision(self.store, self.project.project_id, current)
+        self.assertEqual(self.store.get_project_stage(self.project.project_id, ProjectStageKey.P1).status.value,
+                         "in_progress")
+        self.assertEqual(self.store.get_project_stage(self.project.project_id, ProjectStageKey.P3).status.value,
+                         "in_progress")
+
+    def test_evidence_ids_must_belong_to_this_projects_approved_report(self):
+        decision = self.decision(supporting_evidence_ids=["other-project-evidence"])
+        with self.assertRaisesRegex(ValueError, "must match evidence IDs"):
+            save_validation_decision(self.store, self.project.project_id, decision)
+
+
+if __name__ == "__main__":
+    unittest.main()

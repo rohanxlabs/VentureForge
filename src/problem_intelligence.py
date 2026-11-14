@@ -162,8 +162,8 @@ def generate_frame(data: ProblemInput) -> ProblemFrame:
 
 
 class ValidationAssessment(BaseModel):
-    recommendation: Literal["validated", "partially_validated", "insufficiently_validated", "rejected"]
-    confidence: Literal["high", "medium", "low"]
+    recommendation: Literal["human_review_required"] = "human_review_required"
+    confidence: Literal["not_assessed"] = "not_assessed"
     summary: str
     dimensions: dict[str, str]
     supporting_evidence_ids: list[str] = Field(default_factory=list)
@@ -229,6 +229,8 @@ def _artifact(store: ProjectStore, project_id: str, stage: ProjectStageKey,
 
 def save_frame(store: ProjectStore, project_id: str, frame: ProblemFrame):
     store.get_project(project_id)
+    from src.hackathon_intake import require_approved_challenge_brief_if_started
+    require_approved_challenge_brief_if_started(store, project_id)
     stage = store.get_project_stage(project_id, ProjectStageKey.P1)
     if stage.status.value == "pending":
         store.start_project_stage(project_id, ProjectStageKey.P1)
@@ -252,6 +254,8 @@ def save_frame(store: ProjectStore, project_id: str, frame: ProblemFrame):
 
 def start_problem_framing(store: ProjectStore, project_id: str):
     """Start P1 via the M1 stage API; report the current stage if already started."""
+    from src.hackathon_intake import require_approved_challenge_brief_if_started
+    require_approved_challenge_brief_if_started(store, project_id)
     stage = store.get_project_stage(project_id, ProjectStageKey.P1)
     if stage.status.value == "pending":
         stage = store.start_project_stage(project_id, ProjectStageKey.P1)
@@ -382,14 +386,7 @@ def assess_problem(store: ProjectStore, project_id: str, run_id: str) -> Validat
     supporting = [e.id for e in verified if e.relation.value == "supports"]
     contradicting = [e.id for e in verified if e.relation.value == "weakens"]
     unknowns = [q.text for q in questions if not any(e.question_id == q.id for e in verified)]
-    enough = len(verified) >= 2 and bool(questions) and not unknowns
-    recommendation = "partially_validated" if verified else "insufficiently_validated"
-    if enough and not contradicting:
-        recommendation = "validated"
-    elif contradicting and not supporting:
-        recommendation = "insufficiently_validated"
-    return ValidationAssessment(recommendation=recommendation,
-        confidence="low" if unknowns or not verified else "medium",
+    return ValidationAssessment(
         summary=f"Review of research run {run_id}: {len(verified)} exact-passage verified record(s).",
         dimensions={"problem_existence": "supported" if verified else "not established",
             "target_user": "requires human review", "frequency": "not established without direct measurements",
@@ -399,7 +396,7 @@ def assess_problem(store: ProjectStore, project_id: str, run_id: str) -> Validat
             "coverage": f"{len(questions)-len(unknowns)}/{len(questions)} questions have verified evidence",
             "uncertainty": "material unknowns remain" if unknowns else "review source limits"},
         supporting_evidence_ids=supporting, contradicting_evidence_ids=contradicting,
-        unknowns=unknowns, rationale="This deterministic assessment checks record validity and coverage only. Exact passage verification does not establish semantic support or factual truth.")
+        unknowns=unknowns, rationale="Descriptive record summary only. Exact-passage verification and question coverage do not establish semantic support, factual truth, or user need.")
 
 
 def save_assessment(store: ProjectStore, project_id: str, assessment: ValidationAssessment):
@@ -416,11 +413,5 @@ def save_assessment(store: ProjectStore, project_id: str, assessment: Validation
 
 def approve_assessment(store: ProjectStore, project_id: str, artifact_id: str,
                        decision_id: str, status: ApprovalEventStatus, comment: str = ""):
-    artifact = store.get_artifact(project_id, artifact_id)
-    if artifact.stage_key != ProjectStageKey.P3 or artifact.artifact_type != "validation_assessment":
-        raise ValueError("Artifact is not a P3 validation assessment.")
-    store.record_artifact_approval(project_id, artifact_id, status, comment=comment)
-    event = store.record_decision_approval(project_id, decision_id, status, comment=comment)
-    if status == ApprovalEventStatus.APPROVED:
-        store.complete_project_stage(project_id, ProjectStageKey.P3, note="Assessment accepted by human.")
-    return event
+    raise ValueError("The legacy P3 assessment cannot validate or complete the problem stage. "
+        "Use the P3 Problem Validation workspace to record a human decision with rationale and evidence references.")
