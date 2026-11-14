@@ -1,80 +1,24 @@
 ---
-title: VentureForge - AI Startup Discovery
+title: VentureForge - Hackathon Research Workflow
 emoji: 🚀
 colorFrom: blue
 colorTo: purple
 sdk: gradio
-sdk_version: 5.0.0
+sdk_version: 6.14.0
 app_file: app.py
 pinned: false
 license: mit
 tags:
   - ai-agents
-  - startup-ideas
+  - hackathon
   - langgraph
-  - multi-agent
-  - paul-graham
-  - amd-hackathon
-short_description: Autonomous multi-agent system for startup idea discovery
+short_description: Human-led hackathon research, validation, MVP, and pitch workflow
 ---
 
-# VentureForge 🚀
+# VentureForge
 
-An autonomous multi-agent system that discovers startup ideas by mining real user pain points from online communities, evaluating them with Paul Graham-inspired criteria, and generating investor-ready pitch briefs.
+VentureForge provides a human-led workflow from Challenge Setup through P1 Problem Framing, P2 Research, P3 Problem Validation, P4 Solution Intelligence, P5 Solution Engineering, P6 MVP Execution & Testing, P7 Business, Impact & Risk, and P8 Pitch & Judge Preparation.
 
-**Built for AMD AI Hackathon | Track 1: AI Agents & Agentic Workflows**
+Read [README.md](README.md) for the workflow, local setup, database behavior, checkpoint recovery, and test instructions.
 
-## Features
-
-- 🔍 **Pain Point Mining** from Hacker News, Product Hunt, and web search
-- 🤖 **6 Specialized Agents** (Orchestrator, Miner, Generator, Scorer, Writer, Critic)
-- ✅ **Binary Rubric Evaluation** (yes/no checks, not subjective scores)
-- 🔄 **Reflection Loop** with adversarial critique (max 3 revisions)
-- 📊 **Real-time Progress** tracking in Gradio UI
-- 🎯 **Token Optimized** for vLLM 2048 token limit
-
-## How to Use
-
-1. **Set API Keys** in Space Settings → Repository secrets:
-   - `OPENROUTER_API_KEY` (required)
-   - `TAVILY_API_KEY` (required)
-   - `PRODUCTHUNT_API_KEY` (optional)
-
-2. **Enter a domain** (e.g., "developer tools", "healthcare", "fintech")
-
-3. **Click "Start Discovery"** and watch the agents work!
-
-4. **View results** in the tabs:
-   - Pain Points (with evidence sources)
-   - Ideas (generated from pain points)
-   - Scored Ideas (8 binary checks)
-   - Pitch Briefs (investor-ready)
-   - Critiques (adversarial review)
-
-## Architecture
-
-```
-Orchestrator → Pain Point Miner → Idea Generator → Scorer → Pitch Writer → Critic
-                                                                              ↓
-                                                                    (reflection loop)
-```
-
-## Documentation
-
-- [README.md](README.md) - Quick start guide
-- [PROJECT.md](PROJECT.md) - Detailed architecture
-- [orchestration.json](orchestration.json) - Machine-readable spec
-
-## Performance
-
-- **Duration:** ~2 minutes per domain
-- **Token Optimized:** One-at-a-time generation + compressed prompts
-- **Reliable:** 0 JSON failures on all domains (healthcare, developer tools, finance)
-
-## License
-
-MIT License - see [LICENSE](LICENSE) file for details
-
----
-
-**Built with ❤️ for AMD AI Hackathon**
+The original startup-discovery pipeline remains an optional, separate tool in the app.

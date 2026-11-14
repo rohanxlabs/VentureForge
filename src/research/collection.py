@@ -1,5 +1,7 @@
 from __future__ import annotations
+from pathlib import Path
 from src.config import settings
+from src.database_config import DEFAULT_DATABASE_PATH
 from src.research.budget import SearchBudget
 from src.research.connectors import HackerNewsConnector,TavilyConnector
 from src.research.models import ResearchPlan
@@ -17,7 +19,7 @@ def collect_plan_sources(plan:ResearchPlan,store:ResearchStore,*,budget:SearchBu
     result.sources=[store.save_source(source) for source in result.sources]
     return result
 
-def collect_saved_plan(plan_id:str,database_path:str="data/research.sqlite",*,budget:SearchBudget|None=None,orchestrator:SearchOrchestrator|None=None)->CollectionResult:
+def collect_saved_plan(plan_id:str,database_path:str|Path=DEFAULT_DATABASE_PATH,*,budget:SearchBudget|None=None,orchestrator:SearchOrchestrator|None=None)->CollectionResult:
     store=ResearchStore(database_path)
     plan=store.get_plan(plan_id)
     return collect_plan_sources(plan,store,budget=budget,orchestrator=orchestrator)

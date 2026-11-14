@@ -17,11 +17,50 @@ class ValidationOutcome(StrEnum):
     STOP = "stop"
 
 
+class PrimaryResearchMethod(StrEnum):
+    INTERVIEW = "interview"
+    OBSERVATION = "observation"
+    SURVEY = "survey"
+
+
+class PrimaryResearchRecord(BaseModel):
+    method: PrimaryResearchMethod
+    conducted_at: str = Field(min_length=3, max_length=100)
+    participant_context: str = Field(min_length=5, max_length=1500)
+    recruitment_context: str = Field(min_length=3, max_length=1000)
+    questions_or_task: list[str] = Field(min_length=1, max_length=30)
+    findings: list[str] = Field(min_length=1, max_length=50)
+    contradictory_findings: list[str] = Field(default_factory=list, max_length=50)
+    limitations: str = Field(min_length=5, max_length=2000)
+    consent_and_privacy: str = Field(min_length=5, max_length=1000)
+    researcher: str = Field(min_length=2, max_length=200)
+    problem_frame_artifact_id: str
+    problem_frame_version: int = Field(ge=1)
+
+    @field_validator("conducted_at", "participant_context", "recruitment_context", "limitations",
+                     "consent_and_privacy", "researcher")
+    @classmethod
+    def required_text_is_not_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("This field cannot be blank.")
+        return value
+
+    @field_validator("questions_or_task", "findings", "contradictory_findings")
+    @classmethod
+    def clean_research_items(cls, values: list[str]) -> list[str]:
+        cleaned = [value.strip() for value in values]
+        if any(not value for value in cleaned):
+            raise ValueError("Research entries cannot be blank.")
+        return cleaned
+
+
 class ValidationDecision(BaseModel):
     outcome: ValidationOutcome
     rationale: str = Field(min_length=20, max_length=8000)
     supporting_evidence_ids: list[str] = Field(default_factory=list)
     contradicting_evidence_ids: list[str] = Field(default_factory=list)
+    primary_research_artifact_ids: list[str] = Field(default_factory=list)
     first_hand_evidence: str = ""
     evidence_limitations: str = ""
     unresolved_questions: list[str] = Field(default_factory=list)
@@ -43,7 +82,7 @@ class ValidationDecision(BaseModel):
             raise ValueError("This field cannot be blank.")
         return value
 
-    @field_validator("supporting_evidence_ids", "contradicting_evidence_ids", "unresolved_questions")
+    @field_validator("supporting_evidence_ids", "contradicting_evidence_ids", "primary_research_artifact_ids", "unresolved_questions")
     @classmethod
     def clean_values(cls, values: list[str]) -> list[str]:
         if any(not isinstance(value, str) or not value.strip() for value in values):
@@ -69,17 +108,27 @@ def validation_context(store: ProjectStore, project_id: str) -> dict:
     """Return exact upstream artifacts and readable evidence for the P3 review UI."""
     store.get_project(project_id)
     frame = _latest(store, project_id, ProjectStageKey.P1, "problem_frame")
+    plan = _latest(store, project_id, ProjectStageKey.P2, "research_plan")
     report = _latest(store, project_id, ProjectStageKey.P2, "research_report")
     if frame is None or store.get_artifact_approval_status(project_id, frame.artifact_id) != "approved":
         raise ValueError("P3 requires the latest Problem Frame to be approved.")
     if report is None or store.get_artifact_approval_status(project_id, report.artifact_id) != "approved":
         raise ValueError("P3 requires an approved P2 research report.")
+    if plan is None or store.get_artifact_approval_status(project_id, plan.artifact_id) != "approved":
+        raise ValueError("P3 requires the latest P2 research plan to be approved.")
     if store.get_project_stage(project_id, ProjectStageKey.P1).status.value != "completed":
         raise ValueError("P1 must be complete before P3 review.")
     if store.get_project_stage(project_id, ProjectStageKey.P2).status.value != "completed":
         raise ValueError("P2 must be complete before P3 review.")
     frame_data = json.loads(frame.content or "{}")
+    plan_data = json.loads(plan.content or "{}")
     report_data = json.loads(report.content or "{}")
+    if (plan_data.get("problem_frame_artifact_id") != frame.artifact_id
+            or plan_data.get("problem_frame_version") != frame.version):
+        raise ValueError("The latest P2 research plan references an older P1 version. Revise and approve P2 before validation.")
+    if (report_data.get("plan_artifact_id") != plan.artifact_id
+            or report_data.get("plan_id") != plan_data.get("id")):
+        raise ValueError("The latest P2 research report does not match the latest approved research plan. Rerun P2 before validation.")
     evidence_lines = []
     for item in report_data.get("evidence", []):
         evidence_lines.append(
@@ -107,9 +156,40 @@ def validation_context(store: ProjectStore, project_id: str) -> dict:
         f"**Current workflow:** {frame_data.get('workflow_summary', '')}\n\n"
         f"**Unknowns:** {', '.join(frame_data.get('unknowns', [])) or 'None listed'}")
     ids = {item.get("id") for item in report_data.get("evidence", []) if item.get("id")}
-    return {"frame": frame, "report": report, "frame_view": frame_view,
+    primary_records = [item for item in store.list_project_artifacts(project_id)
+        if item.stage_key == ProjectStageKey.P3 and item.artifact_type == "primary_research_record"]
+    primary_view = "\n\n".join(
+        f"### Primary research record `{item.artifact_id}` v{item.version}\n\n"
+        f"{json.loads(item.content or '{}').get('method', 'unknown').title()} | "
+        f"{json.loads(item.content or '{}').get('conducted_at', '')}\n\n"
+        f"Participant context: {json.loads(item.content or '{}').get('participant_context', '')}\n\n"
+        f"Findings: {'; '.join(json.loads(item.content or '{}').get('findings', []))}\n\n"
+        f"Limitations: {json.loads(item.content or '{}').get('limitations', '')}"
+        for item in primary_records)
+    return {"frame": frame, "plan": plan, "report": report, "frame_view": frame_view,
             "report_view": "\n".join(report_view), "evidence_ids": ids,
-            "unanswered_questions": gaps}
+            "unanswered_questions": gaps, "primary_records": primary_records,
+            "primary_view": primary_view or "No structured first-hand research records have been saved.",
+            "primary_record_ids": {item.artifact_id for item in primary_records}}
+
+
+def save_primary_research_record(store: ProjectStore, project_id: str, record: PrimaryResearchRecord):
+    """Save one structured interview, observation, or survey as a project artifact."""
+    context = validation_context(store, project_id)
+    frame = context["frame"]
+    if (record.problem_frame_artifact_id != frame.artifact_id
+            or record.problem_frame_version != frame.version):
+        raise ValueError("P1 changed since this research record was prepared. Reload the current frame.")
+    stage = store.get_project_stage(project_id, ProjectStageKey.P3)
+    if stage.status.value == "pending":
+        store.start_project_stage(project_id, ProjectStageKey.P3)
+    elif stage.status.value != "in_progress":
+        raise ValueError(f"Primary research cannot be recorded while P3 is {stage.status.value}.")
+    create = ArtifactCreate(project_id=project_id, stage_key=ProjectStageKey.P3,
+        artifact_type="primary_research_record", title=f"{record.method.value.title()} research record",
+        description="Structured first-hand validation record; sensitive personal identifiers should not be stored.",
+        content=record.model_dump_json(indent=2))
+    return store.create_artifact(create)
 
 
 def save_validation_decision(store: ProjectStore, project_id: str,
@@ -124,6 +204,14 @@ def save_validation_decision(store: ProjectStore, project_id: str,
     cited = set(decision.supporting_evidence_ids + decision.contradicting_evidence_ids)
     if not cited.issubset(context["evidence_ids"]):
         raise ValueError("Evidence references must match evidence IDs in the approved P2 report.")
+    if not set(decision.primary_research_artifact_ids).issubset(context["primary_record_ids"]):
+        raise ValueError("Primary research references must match saved records for this project.")
+    for artifact_id in decision.primary_research_artifact_ids:
+        primary = store.get_artifact(project_id, artifact_id)
+        primary_data = json.loads(primary.content or "{}")
+        if (primary_data.get("problem_frame_artifact_id") != frame.artifact_id
+                or primary_data.get("problem_frame_version") != frame.version):
+            raise ValueError("A selected primary research record references an older P1 version.")
 
     stage = store.get_project_stage(project_id, ProjectStageKey.P3)
     if stage.status.value == "pending":

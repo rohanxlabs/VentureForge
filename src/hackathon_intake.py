@@ -2,13 +2,12 @@
 from __future__ import annotations
 
 import json
-import os
-from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
 from src.project_store import ProjectStore
+from src.database_config import resolve_database_path
 from src.research.models import (
     ApprovalEventStatus,
     ArtifactCreate,
@@ -16,7 +15,7 @@ from src.research.models import (
 )
 
 
-PROJECT_DATABASE = Path(os.getenv("VENTUREFORGE_PROJECT_DB", "data/research.sqlite"))
+PROJECT_DATABASE = resolve_database_path()
 
 
 class JudgingCriterion(BaseModel):
@@ -343,11 +342,26 @@ def build_challenge_setup_ui(gr) -> None:
         except Exception as exc:
             return f"P1 is still locked: {exc}", ""
 
+    def orchestrate_workflow_ui(project_id):
+        if not project_id:
+            return "Select or create a project first."
+        try:
+            from src.hackathon_graph import start_or_resume_hackathon_workflow
+            state = start_or_resume_hackathon_workflow(project_id)
+            stage_lines = [f"- **{stage}:** {status}" for stage, status in state.get("stage_statuses", {}).items()]
+            return (f"### Hackathon workflow: {state.get('workflow_status', 'unknown')}\n\n"
+                f"**Current stage:** {state.get('current_stage', 'unknown')}\n\n"
+                f"{state.get('message', '')}\n\n"
+                "#### Project stage status\n" + "\n".join(stage_lines))
+        except Exception as exc:
+            return f"Could not start or resume the Hackathon workflow: {exc}"
+
     with gr.Column():
         gr.Markdown(
             """# VentureForge Hackathon Workspace
             Start with the event brief and constraints. Review and approve this setup before moving into P1 Problem Framing.
             """)
+        gr.Markdown(f"**Active project and research database:** `{PROJECT_DATABASE}`")
         with gr.Accordion("Create a project", open=True):
             with gr.Row():
                 project_name = gr.Textbox(label="Project name", placeholder="e.g. Community Flood Alert")
@@ -359,6 +373,11 @@ def build_challenge_setup_ui(gr) -> None:
         with gr.Row():
             project_selector = gr.Dropdown(label="Project", choices=project_choices(), value=None)
             refresh_button = gr.Button("Refresh projects")
+
+        with gr.Accordion("LangGraph workflow orchestration", open=False):
+            gr.Markdown("Run the separate, human-gated Challenge Setup and P1-P8 coordinator. After completing a stage in its workspace, resume here to refresh progress and reach the next stage.")
+            orchestrate_button = gr.Button("Start / resume Hackathon workflow")
+            orchestrate_status = gr.Markdown("Workflow not started.")
 
         with gr.Accordion("Challenge Setup - event, rules, and rubric", open=True):
             gr.Markdown("Record requirements from the official event materials. Use one line per item. For criteria, use `Criterion | weight% | what judges look for`; weights may be omitted, or must total 100% if all are supplied.")
@@ -415,6 +434,7 @@ def build_challenge_setup_ui(gr) -> None:
             inputs=[project_name, project_domain, project_description],
             outputs=[project_selector, project_create_status])
         refresh_button.click(refresh_projects_ui, inputs=[project_selector], outputs=[project_selector])
+        orchestrate_button.click(orchestrate_workflow_ui, inputs=[project_selector], outputs=[orchestrate_status])
         project_selector.change(inspect_project_ui, inputs=[project_selector],
             outputs=[project_summary, brief_artifact_id, brief_decision_id, brief_save_status])
         save_brief_button.click(save_brief_ui,

@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -5,8 +6,11 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from src.hackathon_validation import (
+    PrimaryResearchMethod,
+    PrimaryResearchRecord,
     ValidationDecision,
     ValidationOutcome,
+    save_primary_research_record,
     save_validation_decision,
     validation_context,
 )
@@ -128,6 +132,38 @@ class HackathonValidationTests(unittest.TestCase):
         decision = self.decision(supporting_evidence_ids=["other-project-evidence"])
         with self.assertRaisesRegex(ValueError, "must match evidence IDs"):
             save_validation_decision(self.store, self.project.project_id, decision)
+
+    def test_structured_primary_research_is_saved_and_linked_to_p3_decision(self):
+        context = validation_context(self.store, self.project.project_id)
+        record = PrimaryResearchRecord(method=PrimaryResearchMethod.INTERVIEW,
+            conducted_at="2026-11-14", participant_context="Three local warning recipients; no names recorded.",
+            recruitment_context="Invited through a community preparedness group.",
+            questions_or_task=["Describe the last warning you received."],
+            findings=["Two participants did not know which route to take."],
+            contradictory_findings=["One participant reported receiving a timely warning."],
+            limitations="Small convenience sample; recall bias is possible.",
+            consent_and_privacy="Participants agreed to anonymous notes; no recordings retained.",
+            researcher="Team member A", problem_frame_artifact_id=context["frame"].artifact_id,
+            problem_frame_version=context["frame"].version)
+        artifact = save_primary_research_record(self.store, self.project.project_id, record)
+        self.assertEqual(artifact.artifact_type, "primary_research_record")
+        refreshed = validation_context(self.store, self.project.project_id)
+        self.assertIn(artifact.artifact_id, refreshed["primary_view"])
+
+        decision = self.decision(primary_research_artifact_ids=[artifact.artifact_id])
+        saved, _linked = save_validation_decision(self.store, self.project.project_id, decision)
+        self.assertEqual(json.loads(saved.content)["primary_research_artifact_ids"],
+                         [artifact.artifact_id])
+
+    def test_p3_rejects_an_approved_p2_plan_linked_to_an_older_p1_frame(self):
+        revised = create_frame(ProblemInput(title="Warning delays",
+            description="Residents in remote areas receive local warnings too late.",
+            primary_users=["Residents in remote hazard-prone areas"]))
+        frame, decision = save_frame(self.store, self.project.project_id, revised)
+        approve_frame(self.store, self.project.project_id, frame.artifact_id,
+            decision.decision_id, ApprovalEventStatus.APPROVED)
+        with self.assertRaisesRegex(ValueError, "P2 research plan references an older P1 version"):
+            validation_context(self.store, self.project.project_id)
 
 
 if __name__ == "__main__":
